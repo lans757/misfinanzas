@@ -1,0 +1,28 @@
+# Base de datos local
+finanzas.db
+
+# Clave secreta JWT (no subir nunca)
+.secret_key
+
+# API Keys
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Entornos virtuales
+venv/
+env/
+.venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp

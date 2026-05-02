@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MisFinanzas 💰</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            surface: { DEFAULT: '#1a1d27', 2: '#222536' },
+            border:  { DEFAULT: '#2d3149' },
+            muted:   '#8892a4',
+            brand: {
+              green: '#00c896', red: '#ff4d6d',
+              blue: '#4f8ef7', yellow: '#f7c94f', purple: '#a78bfa'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { background: #0f1117; color: #e2e8f0; font-family: 'Segoe UI', system-ui, sans-serif; margin: 0; }
+    select option { background: #222536; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #1a1d27; }
+    ::-webkit-scrollbar-thumb { background: #2d3149; border-radius: 3px; }
+    input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: invert(0.5); }
+    .fade-in { animation: fadeIn .2s ease; }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    /* ── Constantes ─────────────────────────────────────────────────────── */
+    const CATS_INGRESO  = ['Sueldo','Freelance','Inversión','Bono','Comisión','Negocio','Transferencia recibida','Otro ingreso'];
+    const CATS_GASTO    = ['Comida','Transporte','Servicios','Entretenimiento','Salud','Educación','Ropa','Ahorro Binance','Hogar','Deuda','Otro gasto'];
+    const PAY_METHODS   = ['Efectivo','Pago Móvil','Binance','Transferencia','Zelle','Dólares efectivo','Otro'];
+    const CHART_COLORS  = ['#4f8ef7','#00c896','#f7c94f','#ff4d6d','#a78bfa','#fb923c','#34d399','#f87171','#38bdf8','#e879f9'];
+    const LS_TOKEN      = 'finanzas_token';
+    const LS_USER       = 'finanzas_username';
+
+    /* ── Formatters ─────────────────────────────────────────────────────── */
+    const fmtVES  = n => `Bs ${(n||0).toLocaleString('es-VE',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+    const fmtUSD  = n => `$${(n||0).toFixed(2)}`;
+    const fmtUSDT = n => `${(n||0).toFixed(4)} USDT`;
+    const fmtDate = d => new Date(d).toLocaleDateString('es-VE',{day:'2-digit',month:'2-digit',year:'2-digit'});
+    const fmtDateTime = d => {
+      const dt = new Date(d);
+      return dt.toLocaleDateString('es-VE',{day:'2-digit',month:'2-digit',year:'2-digit'})
+        +' '+dt.toLocaleTimeString('es-VE',{hour:'2-digit',minute:'2-digit'});
+    };
+    const fmtOrig = (amount, currency) =>
+      currency==='USDT' ? fmtUSDT(amount) : currency==='USD' ? fmtUSD(amount) : fmtVES(amount);
+    const fmtRate = n => n ? n.toLocaleString('es-VE',{minimumFractionDigits:2,maximumFractionDigits:2}) : '--';
+
+    /* ── API client (recibe token) ──────────────────────────────────────── */
+    function makeApi(token, onUnauthorized) {
+      const h = { 'Authorization': `Bearer ${token}` };
+      const guard = r => {
+        if (r.status===401) { onUnauthorized(); throw new Error('unauthorized'); }
+        return r.json();
+      };
+      return {
+        getRates:        () => fetch('/api/rates').then(r=>r.json()),
+        getTransactions: () => fetch('/api/transactions',{headers:h}).then(guard),
+        getSummary:      () => fetch('/api/summary',{headers:h}).then(guard),
+        getFlow:         () => fetch('/api/monthly-flow',{headers:h}).then(guard),
+        verifyToken:     () => fetch('/api/auth/me',{headers:h}).then(r=>r.ok ? r.json() : null),
+        add: data => fetch('/api/transactions',{
+          method:'POST', headers:{...h,'Content-Type':'application/json'}, body:JSON.stringify(data)
+        }).then(async r=>{ if(!r.ok){const e=await r.json();throw e;} return r.json(); }),
+        del: id => fetch(`/api/transactions/${id}`,{method:'DELETE',headers:h}).then(guard),
+      };
+    }
+
+    /* ── Toast ──────────────────────────────────────────────────────────── */
+    function useToast() {
+      const [toasts, setToasts] = useState([]);
+      const show = (msg, type='success') => {
+        const id = Date.now();
+        setToasts(p=>[...p,{id,msg,type}]);
+        setTimeout(()=>setToasts(p=>p.filter(t=>t.id!==id)),3500);
+      };
+      const ToastContainer = () => (
+        <div className="fixed bottom-6 right-6 flex flex-col gap-2 z-50 pointer-events-none">
+          {toasts.map(t=>(
+            <div key={t.id} className={`fade-in px-4 py-3 rounded-xl border text-sm font-semibold shadow-xl ${
+              t.type==='success' ? 'bg-[#0d2118] border-brand-green text-brand-green'
+                                 : 'bg-[#220a0f] border-brand-red text-brand-red'
+            }`}>{t.msg}</div>
+          ))}
+        </div>
+      );
+      return { show, ToastContainer };
+    }
+
+    /* ── Charts ─────────────────────────────────────────────────────────── */
+    function FlowChart({ data }) {
+      const ref = useRef(null); const inst = useRef(null);
+      useEffect(()=>{
+        if(!ref.current||!data?.labels?.length) return;
+        if(inst.current) inst.current.destroy();
+        inst.current = new Chart(ref.current, {
+          type:'bar',
+          data:{ labels:data.labels, datasets:[
+            {label:'Ingresos',data:data.ingresos,backgroundColor:'#00c89640',borderColor:'#00c896',borderWidth:2,borderRadius:6},
+            {label:'Gastos',  data:data.gastos,  backgroundColor:'#ff4d6d40',borderColor:'#ff4d6d',borderWidth:2,borderRadius:6},
+          ]},
+          options:{
+            responsive:true,maintainAspectRatio:false,
+            plugins:{
+              legend:{labels:{color:'#8892a4',boxWidth:12}},
+              tooltip:{callbacks:{label:ctx=>` ${ctx.dataset.label}: ${fmtVES(ctx.raw)}`}}
+            },
+            scales:{
+              x:{ticks:{color:'#8892a4'},grid:{color:'#2d314930'}},
+              y:{ticks:{color:'#8892a4',callback:v=>`Bs ${(v/1000).toFixed(0)}K`},grid:{color:'#2d3149'}}
+            }
+          }
+        });
+        return ()=>{ if(inst.current) inst.current.destroy(); };
+      },[JSON.stringify(data)]);
+      return <div style={{height:220}}><canvas ref={ref}/></div>;
+    }
+
+    function CategoryChart({ data }) {
+      const ref = useRef(null); const inst = useRef(null);
+      useEffect(()=>{
+        if(!ref.current||!data) return;
+        const entries = Object.entries(data).sort((a,b)=>b[1]-a[1]).slice(0,8);
+        if(!entries.length) return;
+        if(inst.current) inst.current.destroy();
+        inst.current = new Chart(ref.current, {
+          type:'doughnut',
+          data:{
+            labels:entries.map(e=>e[0]),
+            datasets:[{data:entries.map(e=>e[1]),backgroundColor:CHART_COLORS,borderColor:'#1a1d27',borderWidth:3}]
+          },
+          options:{
+            responsive:true,maintainAspectRatio:false,
+            plugins:{
+              legend:{position:'right',labels:{color:'#8892a4',font:{size:11},padding:10}},
+              tooltip:{callbacks:{label:ctx=>` ${ctx.label}: ${fmtVES(ctx.raw)}`}}
+            }
+          }
+        });
+        return ()=>{ if(inst.current) inst.current.destroy(); };
+      },[JSON.stringify(data)]);
+      return <div style={{height:220}}><canvas ref={ref}/></div>;
+    }
+
+    /* ── Pantalla de Login / Registro ───────────────────────────────────── */
+    function AuthScreen({ onAuth }) {
+      const [mode,    setMode]    = useState('login');
+      const [form,    setForm]    = useState({ username:'', password:'', confirm:'' });
+      const [error,   setError]   = useState('');
+      const [loading, setLoading] = useState(false);
+
+      const set = (k,v) => { setForm(p=>({...p,[k]:v})); setError(''); };
+      const switchMode = m => { setMode(m); setError(''); setForm({username:form.username,password:'',confirm:''}); };
+
+      const handleSubmit = async e => {
+        e.preventDefault();
+        if (mode==='register') {
+          if (form.password!==form.confirm) { setError('Las contraseñas no coinciden'); return; }
+          if (form.password.length < 6)     { setError('La contraseña debe tener mínimo 6 caracteres'); return; }
+          if (form.username.trim().length<3) { setError('El usuario debe tener mínimo 3 caracteres'); return; }
+        }
+        setLoading(true); setError('');
+        try {
+          const url  = mode==='login' ? '/api/auth/login' : '/api/auth/register';
+          const resp = await fetch(url, {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ username:form.username.trim(), password:form.password })
+          });
+          const data = await resp.json();
+          if (!resp.ok) { setError(data.detail || 'Error de autenticación'); }
+          else { onAuth({ token:data.access_token, username:data.username }); }
+        } catch { setError('Error de conexión. Verifica que el servidor esté activo.'); }
+        finally { setLoading(false); }
+      };
+
+      return (
+        <div className="min-h-screen bg-[#0f1117] flex items-center justify-center p-4">
+          <div className="w-full max-w-sm fade-in">
+            {/* Logo */}
+            <div className="text-center mb-8">
+              <div className="text-6xl mb-3">💰</div>
+              <h1 className="text-3xl font-black text-white tracking-tight">MisFinanzas</h1>
+              <p className="text-muted mt-2 text-sm">Gestión personal de ingresos y gastos</p>
+            </div>
+
+            {/* Card */}
+            <div className="bg-surface border border-border rounded-2xl p-7 shadow-2xl">
+              {/* Toggle */}
+              <div className="flex gap-2 mb-6 bg-surface-2 p-1 rounded-xl">
+                {['login','register'].map(m=>(
+                  <button key={m} onClick={()=>switchMode(m)}
+                    className={`flex-1 py-2 rounded-lg text-sm font-semibold transition-all ${
+                      mode===m ? 'bg-brand-blue text-white shadow' : 'text-muted hover:text-white'
+                    }`}>
+                    {m==='login' ? 'Iniciar sesión' : 'Registrarse'}
+                  </button>
+                ))}
+              </div>
+
+              <form onSubmit={handleSubmit} className="space-y-4">
+                <div>
+                  <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Usuario</label>
+                  <input type="text" value={form.username} onChange={e=>set('username',e.target.value)}
+                    placeholder="tu_nombre_de_usuario" autoFocus required
+                    className="w-full bg-surface-2 border border-border rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] transition-colors" />
+                </div>
+
+                <div>
+                  <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Contraseña</label>
+                  <input type="password" value={form.password} onChange={e=>set('password',e.target.value)}
+                    placeholder={mode==='register' ? 'Mínimo 6 caracteres' : '••••••••'} required
+                    className="w-full bg-surface-2 border border-border rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] transition-colors" />
+                </div>
+
+                {mode==='register' && (
+                  <div className="fade-in">
+                    <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Confirmar contraseña</label>
+                    <input type="password" value={form.confirm} onChange={e=>set('confirm',e.target.value)}
+                      placeholder="Repite tu contraseña" required
+                      className="w-full bg-surface-2 border border-border rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] transition-colors" />
+                  </div>
+                )}
+
+                {error && (
+                  <div className="fade-in bg-brand-red/10 border border-brand-red/30 text-brand-red text-sm px-4 py-3 rounded-xl flex items-start gap-2">
+                    <span className="shrink-0 mt-0.5">⚠</span> {error}
+                  </div>
+                )}
+
+                <button type="submit" disabled={loading}
+                  className={`w-full py-3 rounded-xl font-bold text-sm transition-all mt-1 ${
+                    loading ? 'bg-[#3d4266] text-muted cursor-not-allowed'
+                            : 'bg-brand-blue hover:bg-[#3d7de0] text-white active:scale-[.98]'
+                  }`}>
+                  {loading
+                    ? <span className="flex items-center justify-center gap-2"><span className="spin inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full"/>Cargando...</span>
+                    : mode==='login' ? 'Iniciar sesión →' : 'Crear cuenta →'
+                  }
+                </button>
+              </form>
+
+              {mode==='login' && (
+                <p className="text-center text-xs text-muted mt-4">
+                  ¿No tienes cuenta?{' '}
+                  <button onClick={()=>switchMode('register')} className="text-brand-blue hover:underline">Regístrate gratis</button>
+                </p>
+              )}
+              {mode==='register' && (
+                <p className="text-center text-xs text-muted mt-4">
+                  ¿Ya tienes cuenta?{' '}
+                  <button onClick={()=>switchMode('login')} className="text-brand-blue hover:underline">Inicia sesión</button>
+                </p>
+              )}
+            </div>
+
+            <p className="text-center text-xs text-muted mt-6 opacity-50">
+              Tus datos son privados y solo tú puedes verlos.
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    /* ── Formulario de transacción ───────────────────────────────────────── */
+    function TransactionForm({ onClose, onSave, rates }) {
+      const now = new Date(); now.setMinutes(now.getMinutes()-now.getTimezoneOffset());
+      const [form, setForm] = useState({
+        type:'gasto', description:'', category:CATS_GASTO[0],
+        amount:'', currency:'VES', payment_method:PAY_METHODS[0],
+        exchange_rate_bcv:rates?.bcv||'', exchange_rate_binance:rates?.binance_p2p||'',
+        notes:'', date:now.toISOString().slice(0,16),
+      });
+      const [saving, setSaving] = useState(false);
+      const set = (k,v) => setForm(p=>({...p,[k]:v}));
+
+      const handleType = t => { set('type',t); set('category', t==='ingreso'?CATS_INGRESO[0]:CATS_GASTO[0]); };
+      const showBcv     = form.currency!=='USDT';
+      const showBinance = form.currency!=='VES';
+
+      const preview = (()=>{
+        const amt = parseFloat(form.amount);
+        if(!amt||amt<=0) return null;
+        if(form.currency==='USD'  && form.exchange_rate_bcv)     return `≈ ${fmtVES(amt*parseFloat(form.exchange_rate_bcv))}`;
+        if(form.currency==='USDT' && form.exchange_rate_binance) return `≈ ${fmtVES(amt*parseFloat(form.exchange_rate_binance))}`;
+        return null;
+      })();
+
+      const handleSubmit = async e => {
+        e.preventDefault();
+        if(!form.description.trim()||!form.amount) return;
+        setSaving(true);
+        try {
+          await onSave({
+            ...form, amount:parseFloat(form.amount),
+            exchange_rate_bcv:    form.exchange_rate_bcv    ? parseFloat(form.exchange_rate_bcv)    : null,
+            exchange_rate_binance:form.exchange_rate_binance? parseFloat(form.exchange_rate_binance): null,
+            date: new Date(form.date).toISOString(),
+          });
+        } finally { setSaving(false); }
+      };
+
+      const cats = form.type==='ingreso' ? CATS_INGRESO : CATS_GASTO;
+
+      return (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-40 flex items-center justify-center p-4 overflow-y-auto"
+          onClick={e=>e.target===e.currentTarget&&onClose()}>
+          <div className="bg-surface border border-border rounded-2xl w-full max-w-lg shadow-2xl my-4 fade-in">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-border">
+              <h2 className="text-base font-bold text-white">Registrar movimiento</h2>
+              <button onClick={onClose} className="text-muted hover:text-white transition-colors w-7 h-7 flex items-center justify-center rounded-lg hover:bg-surface-2">✕</button>
+            </div>
+            <form onSubmit={handleSubmit} className="p-6 space-y-4">
+              <div className="flex gap-2">
+                {['ingreso','gasto'].map(t=>(
+                  <button key={t} type="button" onClick={()=>handleType(t)}
+                    className={`flex-1 py-2.5 rounded-xl font-semibold text-sm transition-all border ${
+                      form.type===t
+                        ? t==='ingreso' ? 'bg-brand-green/20 border-brand-green text-brand-green'
+                                        : 'bg-brand-red/20 border-brand-red text-brand-red'
+                        : 'bg-surface-2 border-border text-muted hover:border-[#4d5169]'
+                    }`}>{t==='ingreso'?'↑ Ingreso':'↓ Gasto'}</button>
+                ))}
+              </div>
+              <div>
+                <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Descripción *</label>
+                <input value={form.description} onChange={e=>set('description',e.target.value)} required
+                  placeholder="Ej: Sueldo quincena, Mercado..."
+                  className="w-full bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169]" />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Categoría</label>
+                  <select value={form.category} onChange={e=>set('category',e.target.value)}
+                    className="w-full bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue">
+                    {cats.map(c=><option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Método de pago</label>
+                  <select value={form.payment_method} onChange={e=>set('payment_method',e.target.value)}
+                    className="w-full bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue">
+                    {PAY_METHODS.map(m=><option key={m} value={m}>{m}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Monto *</label>
+                  <input type="number" step="0.01" min="0" value={form.amount} onChange={e=>set('amount',e.target.value)} required
+                    placeholder="0.00"
+                    className="w-full bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169]" />
+                </div>
+                <div>
+                  <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Moneda</label>
+                  <select value={form.currency} onChange={e=>set('currency',e.target.value)}
+                    className="w-full bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue">
+                    <option value="VES">Bs (VES)</option>
+                    <option value="USD">USD (Dólares)</option>
+                    <option value="USDT">USDT (Binance)</option>
+                  </select>
+                </div>
+              </div>
+              {(showBcv||showBinance) && (
+                <div className="bg-surface-2 rounded-xl p-3 border border-border space-y-2.5">
+                  <p className="text-xs text-muted font-semibold uppercase tracking-wider">Tasas de cambio</p>
+                  {showBcv && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted w-28 shrink-0">BCV (Bs/USD)</span>
+                      <input type="number" step="0.01" value={form.exchange_rate_bcv} onChange={e=>set('exchange_rate_bcv',e.target.value)}
+                        placeholder="Tasa BCV"
+                        className="flex-1 bg-surface border border-border rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169]" />
+                      {rates?.bcv && <button type="button" onClick={()=>set('exchange_rate_bcv',rates.bcv)} className="text-xs text-brand-blue hover:underline whitespace-nowrap">Usar actual</button>}
+                    </div>
+                  )}
+                  {showBinance && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted w-28 shrink-0">Binance (Bs/USDT)</span>
+                      <input type="number" step="0.01" value={form.exchange_rate_binance} onChange={e=>set('exchange_rate_binance',e.target.value)}
+                        placeholder="Tasa Binance"
+                        className="flex-1 bg-surface border border-border rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169]" />
+                      {rates?.binance_p2p && <button type="button" onClick={()=>set('exchange_rate_binance',rates.binance_p2p)} className="text-xs text-brand-yellow hover:underline whitespace-nowrap">Usar actual</button>}
+                    </div>
+                  )}
+                  {preview && <p className="text-xs text-muted">Equivale a: <span className="text-white font-semibold">{preview}</span></p>}
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Fecha</label>
+                  <input type="datetime-local" value={form.date} onChange={e=>set('date',e.target.value)}
+                    className="w-full bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue" />
+                </div>
+                <div>
+                  <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Notas</label>
+                  <input value={form.notes} onChange={e=>set('notes',e.target.value)} placeholder="Opcional..."
+                    className="w-full bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169]" />
+                </div>
+              </div>
+              <button type="submit" disabled={saving}
+                className={`w-full py-3 rounded-xl font-bold text-sm transition-all ${
+                  saving ? 'bg-[#3d4266] text-muted cursor-not-allowed'
+                  : form.type==='ingreso' ? 'bg-brand-green hover:bg-[#00b386] text-[#0a1a12] active:scale-95'
+                                          : 'bg-brand-blue hover:bg-[#3d7de0] text-white active:scale-95'
+                }`}>
+                {saving ? 'Guardando...' : `Registrar ${form.type==='ingreso'?'Ingreso':'Gasto'}`}
+              </button>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    /* ── Summary Card ────────────────────────────────────────────────────── */
+    function SummaryCard({ label, value, sub, icon, colorKey }) {
+      const cm = {
+        blue:   { bg:'bg-brand-blue/10',   text:'text-brand-blue',   border:'border-brand-blue/30'   },
+        green:  { bg:'bg-brand-green/10',  text:'text-brand-green',  border:'border-brand-green/30'  },
+        yellow: { bg:'bg-brand-yellow/10', text:'text-brand-yellow', border:'border-brand-yellow/30' },
+        red:    { bg:'bg-brand-red/10',    text:'text-brand-red',    border:'border-brand-red/30'    },
+      };
+      const c = cm[colorKey];
+      return (
+        <div className={`bg-surface border ${c.border} rounded-2xl p-4 flex items-start gap-3`}>
+          <div className={`${c.bg} ${c.text} w-10 h-10 rounded-xl flex items-center justify-center text-base font-bold shrink-0`}>{icon}</div>
+          <div className="min-w-0">
+            <p className="text-[11px] text-muted uppercase tracking-wider truncate">{label}</p>
+            <p className={`text-lg font-bold ${c.text} mt-0.5 truncate`}>{value}</p>
+            {sub && <p className="text-xs text-muted mt-0.5 truncate">{sub}</p>}
+          </div>
+        </div>
+      );
+    }
+
+    /* ── Dashboard ───────────────────────────────────────────────────────── */
+    function DashboardTab({ summary, flow, rates }) {
+      if (!summary) return <div className="flex items-center justify-center h-64 text-muted text-sm">Cargando datos...</div>;
+      const saldoUSD = rates?.bcv        ? summary.saldo_ves/rates.bcv                        : null;
+      const usdtVES  = rates?.binance_p2p ? summary.usdt_balance*rates.binance_p2p            : null;
+      const cards = [
+        { label:'Saldo en Bolívares',   value:fmtVES(summary.saldo_ves),
+          sub:`+${fmtVES(summary.total_ingresos_ves)} / -${fmtVES(summary.total_gastos_ves)}`, icon:'Bs', colorKey:'blue' },
+        { label:'Equivalente USD (BCV)', value:saldoUSD!=null?fmtUSD(saldoUSD):'--',
+          sub:rates?.bcv?`Tasa BCV: ${fmtRate(rates.bcv)} Bs/$`:'Sin tasa BCV', icon:'$', colorKey:'green' },
+        { label:'Saldo USDT (Binance)',  value:fmtUSDT(summary.usdt_balance),
+          sub:usdtVES!=null?fmtVES(usdtVES):'Sin tasa Binance', icon:'₮', colorKey:'yellow' },
+        { label:'Gastos este mes',       value:fmtVES(summary.monthly_gastos),
+          sub:`Ingresos mes: ${fmtVES(summary.monthly_ingresos)}`, icon:'↓', colorKey:'red' },
+      ];
+      return (
+        <div className="space-y-6 fade-in">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            {cards.map(c=><SummaryCard key={c.label} {...c}/>)}
+          </div>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="bg-surface border border-border rounded-2xl p-5">
+              <h3 className="text-sm font-semibold text-white mb-4">Flujo mensual (últimos 6 meses)</h3>
+              {flow?.labels?.length ? <FlowChart data={flow}/> : <div className="flex items-center justify-center h-48 text-muted text-sm">Sin datos suficientes</div>}
+            </div>
+            <div className="bg-surface border border-border rounded-2xl p-5">
+              <h3 className="text-sm font-semibold text-white mb-4">Gastos por categoría</h3>
+              {Object.keys(summary.categories||{}).length
+                ? <CategoryChart data={summary.categories}/>
+                : <div className="flex items-center justify-center h-48 text-muted text-sm">Sin gastos registrados</div>}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ── Transacciones ───────────────────────────────────────────────────── */
+    function TransactionsTab({ transactions, rates, onAdd, onDelete }) {
+      const [showForm, setShowForm] = useState(false);
+      const [filter,   setFilter]   = useState({ type:'', category:'', search:'' });
+      const allCats = [...new Set(transactions.map(t=>t.category))].sort();
+      const setF = (k,v) => setFilter(p=>({...p,[k]:v}));
+      const filtered = transactions.filter(t=>{
+        if(filter.type     && t.type!==filter.type) return false;
+        if(filter.category && t.category!==filter.category) return false;
+        if(filter.search   && !t.description.toLowerCase().includes(filter.search.toLowerCase())) return false;
+        return true;
+      });
+      const handleSave = async data => { await onAdd(data); setShowForm(false); };
+      return (
+        <div className="space-y-4 fade-in">
+          <div className="flex flex-wrap gap-3 items-center">
+            <input value={filter.search} onChange={e=>setF('search',e.target.value)} placeholder="🔍  Buscar..."
+              className="bg-surface border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] w-48"/>
+            <select value={filter.type} onChange={e=>setF('type',e.target.value)}
+              className="bg-surface border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-blue">
+              <option value="">Todos los tipos</option><option value="ingreso">Ingresos</option><option value="gasto">Gastos</option>
+            </select>
+            <select value={filter.category} onChange={e=>setF('category',e.target.value)}
+              className="bg-surface border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-blue">
+              <option value="">Todas las categorías</option>
+              {allCats.map(c=><option key={c} value={c}>{c}</option>)}
+            </select>
+            <span className="ml-auto text-xs text-muted">{filtered.length} registro{filtered.length!==1?'s':''}</span>
+            <button onClick={()=>setShowForm(true)}
+              className="bg-brand-blue hover:bg-[#3d7de0] text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors flex items-center gap-1.5 active:scale-95">
+              + Agregar
+            </button>
+          </div>
+          <div className="bg-surface border border-border rounded-2xl overflow-hidden">
+            {filtered.length===0 ? (
+              <div className="text-center text-muted py-16 text-sm">
+                {transactions.length===0 ? '¡Sin movimientos! Haz clic en "+ Agregar" para empezar.' : 'Sin resultados.'}
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-border">
+                      {['Fecha','Tipo','Categoría','Descripción','Monto original','En Bolívares','Método',''].map(h=>(
+                        <th key={h} className="px-4 py-3 text-left text-[11px] text-muted uppercase tracking-wider font-semibold whitespace-nowrap">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map(t=>(
+                      <tr key={t.id} className="border-b border-border/50 hover:bg-surface-2 transition-colors">
+                        <td className="px-4 py-3 text-xs text-muted whitespace-nowrap">{fmtDateTime(t.date)}</td>
+                        <td className="px-4 py-3">
+                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold ${
+                            t.type==='ingreso'?'bg-brand-green/15 text-brand-green':'bg-brand-red/15 text-brand-red'
+                          }`}>{t.type==='ingreso'?'↑':'↓'} {t.type}</span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className="bg-surface-2 border border-border text-muted text-xs px-2 py-0.5 rounded-md">{t.category}</span>
+                        </td>
+                        <td className="px-4 py-3 text-sm text-white max-w-[180px]">
+                          <div className="truncate">{t.description}</div>
+                          {t.notes && <div className="text-xs text-muted truncate">{t.notes}</div>}
+                        </td>
+                        <td className="px-4 py-3 text-sm text-muted whitespace-nowrap">{fmtOrig(t.amount,t.currency)}</td>
+                        <td className={`px-4 py-3 text-sm font-bold whitespace-nowrap ${t.type==='ingreso'?'text-brand-green':'text-brand-red'}`}>
+                          {t.type==='ingreso'?'+':'-'}{fmtVES(t.amount_ves)}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-muted whitespace-nowrap">{t.payment_method||'—'}</td>
+                        <td className="px-4 py-3">
+                          <button onClick={()=>onDelete(t.id)}
+                            className="text-muted hover:text-brand-red transition-colors p-1.5 rounded-lg hover:bg-brand-red/10">✕</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+          {showForm && <TransactionForm onClose={()=>setShowForm(false)} onSave={handleSave} rates={rates}/>}
+        </div>
+      );
+    }
+
+    /* ── Ahorros ─────────────────────────────────────────────────────────── */
+    function SavingsTab({ summary, rates, transactions }) {
+      const usdt   = summary?.usdt_balance || 0;
+      const vesVal = rates?.binance_p2p ? usdt*rates.binance_p2p : null;
+      const usdVal = rates?.bcv && vesVal!=null ? vesVal/rates.bcv : null;
+      const usdtTxns = transactions.filter(t=>t.currency==='USDT');
+      return (
+        <div className="space-y-6 fade-in">
+          <div className="bg-gradient-to-br from-surface to-[#1e2235] border border-brand-yellow/30 rounded-2xl p-6 md:p-8">
+            <div className="flex items-center gap-4 mb-6">
+              <div className="w-14 h-14 bg-brand-yellow/15 rounded-2xl flex items-center justify-center text-2xl font-bold text-brand-yellow">₮</div>
+              <div>
+                <p className="text-xs text-muted uppercase tracking-wider font-semibold">Saldo en Binance</p>
+                <p className="text-4xl font-black text-brand-yellow">{fmtUSDT(usdt)}</p>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4 border-t border-border">
+              <div className="bg-surface-2/50 rounded-xl p-4">
+                <p className="text-xs text-muted mb-1 uppercase tracking-wider">Equivalente en Bolívares</p>
+                <p className="text-xl font-bold text-white">{vesVal!=null?fmtVES(vesVal):'--'}</p>
+                <p className="text-xs text-muted mt-1">{rates?.binance_p2p?`Tasa P2P: ${fmtRate(rates.binance_p2p)} Bs/USDT`:'Actualiza las tasas ↻'}</p>
+              </div>
+              <div className="bg-surface-2/50 rounded-xl p-4">
+                <p className="text-xs text-muted mb-1 uppercase tracking-wider">Equivalente en USD</p>
+                <p className="text-xl font-bold text-white">{usdVal!=null?fmtUSD(usdVal):'--'}</p>
+                <p className="text-xs text-muted mt-1">{rates?.bcv?`Tasa BCV: ${fmtRate(rates.bcv)} Bs/USD`:'Actualiza las tasas ↻'}</p>
+              </div>
+            </div>
+          </div>
+          <div className="bg-surface border border-border rounded-2xl p-5">
+            <h3 className="text-sm font-bold text-white mb-4">Historial de movimientos en USDT</h3>
+            {usdtTxns.length===0 ? (
+              <div className="text-center text-muted text-sm py-8">Sin movimientos en USDT. Registra uno con moneda USDT para verlo aquí.</div>
+            ) : (
+              usdtTxns.slice(0,30).map(t=>(
+                <div key={t.id} className="flex items-center justify-between py-3 border-b border-border/50 last:border-0">
+                  <div className="flex items-center gap-3">
+                    <div className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm font-bold shrink-0 ${
+                      t.type==='ingreso'?'bg-brand-green/15 text-brand-green':'bg-brand-red/15 text-brand-red'
+                    }`}>{t.type==='ingreso'?'↑':'↓'}</div>
+                    <div>
+                      <p className="text-sm text-white font-medium">{t.description}</p>
+                      <p className="text-xs text-muted">{fmtDate(t.date)} · {t.category}</p>
+                    </div>
+                  </div>
+                  <div className="text-right shrink-0 ml-4">
+                    <p className={`text-sm font-bold ${t.type==='ingreso'?'text-brand-green':'text-brand-red'}`}>
+                      {t.type==='ingreso'?'+':'-'}{fmtUSDT(t.amount)}
+                    </p>
+                    <p className="text-xs text-muted">{fmtVES(t.amount_ves)}</p>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    /* ── Asistente IA ────────────────────────────────────────────────────── */
+    const SUGGESTED = [
+      '¿Cuánto gasté este mes?',
+      '¿Cómo están mis ahorros en USDT?',
+      '¿En qué categoría gasto más?',
+      'Dame un consejo de ahorro',
+      '¿Cuánto dinero tengo disponible?',
+      '¿Cuál es mi balance general?',
+    ];
+
+    function AITab({ token }) {
+      const [configured, setConfigured] = useState(null);
+      const [apiKeyInput, setApiKeyInput] = useState('');
+      const [savingKey,   setSavingKey]   = useState(false);
+      const [keyError,    setKeyError]    = useState('');
+      const [messages,    setMessages]    = useState([]);
+      const [input,       setInput]       = useState('');
+      const [loading,     setLoading]     = useState(false);
+      const bottomRef = useRef(null);
+      const inputRef  = useRef(null);
+      const h = { 'Authorization': `Bearer ${token}` };
+
+      useEffect(()=>{
+        fetch('/api/ai/status',{headers:h}).then(r=>r.json()).then(d=>setConfigured(d.configured)).catch(()=>setConfigured(false));
+      },[]);
+
+      useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[messages, loading]);
+
+      const saveKey = async e => {
+        e.preventDefault(); setKeyError(''); setSavingKey(true);
+        try {
+          const r = await fetch('/api/ai/key',{method:'POST',headers:{...h,'Content-Type':'application/json'},body:JSON.stringify({api_key:apiKeyInput})});
+          const d = await r.json();
+          if(!r.ok) { setKeyError(d.detail||'Error guardando la key'); }
+          else { setConfigured(true); }
+        } catch { setKeyError('Error de conexión'); }
+        finally { setSavingKey(false); }
+      };
+
+      const sendMessage = async (text) => {
+        if(!text.trim()||loading) return;
+        const userMsg = {role:'user', content:text.trim()};
+        const newMsgs = [...messages, userMsg];
+        setMessages(newMsgs); setInput(''); setLoading(true);
+        try {
+          const r = await fetch('/api/ai/chat',{
+            method:'POST', headers:{...h,'Content-Type':'application/json'},
+            body: JSON.stringify({messages: newMsgs})
+          });
+          const d = await r.json();
+          if(!r.ok) throw new Error(d.detail||'Error');
+          setMessages(prev=>[...prev,{role:'assistant',content:d.response}]);
+        } catch(e) {
+          setMessages(prev=>[...prev,{role:'assistant',content:`⚠️ ${e.message}`}]);
+        } finally { setLoading(false); setTimeout(()=>inputRef.current?.focus(),100); }
+      };
+
+      const handleKey = e => { if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); sendMessage(input); } };
+
+      if(configured===null) return <div className="flex items-center justify-center h-64 text-muted text-sm">Cargando...</div>;
+
+      /* ── Setup screen ── */
+      if(!configured) return (
+        <div className="max-w-lg mx-auto fade-in">
+          <div className="bg-surface border border-border rounded-2xl p-8 text-center">
+            <div className="text-5xl mb-4">🤖</div>
+            <h2 className="text-xl font-bold text-white mb-2">Configura el Asistente IA</h2>
+            <p className="text-muted text-sm mb-6">Usa <span className="text-brand-blue font-semibold">Google Gemini</span> (gratis) para analizar tus finanzas con inteligencia artificial.</p>
+
+            <div className="bg-surface-2 border border-border rounded-xl p-4 text-left mb-6 space-y-2">
+              <p className="text-xs font-bold text-white uppercase tracking-wider mb-3">Cómo obtener tu API key gratis:</p>
+              {['Ve a aistudio.google.com', 'Inicia sesión con tu cuenta Google', 'Clic en "Get API Key" → "Create API key"', 'Copia la key y pégala aquí abajo'].map((s,i)=>(
+                <div key={i} className="flex items-start gap-3">
+                  <span className="w-5 h-5 bg-brand-blue/20 text-brand-blue rounded-full flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">{i+1}</span>
+                  <span className="text-sm text-muted">{s}</span>
+                </div>
+              ))}
+            </div>
+
+            <form onSubmit={saveKey} className="space-y-3">
+              <input value={apiKeyInput} onChange={e=>{setApiKeyInput(e.target.value);setKeyError('');}}
+                placeholder="AIza..." required
+                className="w-full bg-surface-2 border border-border rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] font-mono" />
+              {keyError && <p className="text-brand-red text-xs text-left">⚠️ {keyError}</p>}
+              <button type="submit" disabled={savingKey||!apiKeyInput.trim()}
+                className={`w-full py-3 rounded-xl font-bold text-sm transition-all ${
+                  savingKey||!apiKeyInput.trim() ? 'bg-[#3d4266] text-muted cursor-not-allowed' : 'bg-brand-blue hover:bg-[#3d7de0] text-white active:scale-95'
+                }`}>
+                {savingKey ? 'Guardando...' : '✓ Guardar y activar'}
+              </button>
+            </form>
+            <p className="text-xs text-muted mt-4 opacity-60">Tu API key se guarda en el servidor local. Plan gratuito: 1M tokens/día.</p>
+          </div>
+        </div>
+      );
+
+      /* ── Chat screen ── */
+      return (
+        <div className="flex flex-col fade-in" style={{height:'calc(100vh - 130px)'}}>
+          {/* Messages */}
+          <div className="flex-1 overflow-y-auto space-y-4 pr-1 pb-2">
+            {messages.length===0 && (
+              <div className="text-center py-8">
+                <div className="text-4xl mb-3">🤖</div>
+                <p className="text-white font-semibold mb-1">Asistente Financiero IA</p>
+                <p className="text-muted text-sm mb-6">Pregúntame sobre tus finanzas. Tengo acceso a todos tus datos.</p>
+                <div className="flex flex-wrap gap-2 justify-center">
+                  {SUGGESTED.map(s=>(
+                    <button key={s} onClick={()=>sendMessage(s)}
+                      className="bg-surface border border-border hover:border-brand-blue/50 text-muted hover:text-white text-xs px-3 py-2 rounded-xl transition-all">
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {messages.map((m,i)=>(
+              <div key={i} className={`flex ${m.role==='user'?'justify-end':'justify-start'}`}>
+                <div className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm ${
+                  m.role==='user'
+                    ? 'bg-brand-blue text-white rounded-br-md'
+                    : 'bg-surface border border-border text-white rounded-bl-md'
+                }`} style={{whiteSpace:'pre-wrap',lineHeight:'1.6'}}>
+                  {m.role==='assistant' && <span className="text-brand-yellow text-xs font-bold block mb-1">🤖 Asistente</span>}
+                  {m.content}
+                </div>
+              </div>
+            ))}
+
+            {loading && (
+              <div className="flex justify-start">
+                <div className="bg-surface border border-border rounded-2xl rounded-bl-md px-4 py-3">
+                  <span className="text-brand-yellow text-xs font-bold block mb-1">🤖 Asistente</span>
+                  <div className="flex gap-1 items-center">
+                    {[0,1,2].map(i=>(
+                      <div key={i} className="w-2 h-2 bg-muted rounded-full animate-bounce" style={{animationDelay:`${i*0.15}s`}}/>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+            <div ref={bottomRef}/>
+          </div>
+
+          {/* Input */}
+          <div className="pt-3 border-t border-border">
+            <div className="flex gap-2">
+              <textarea ref={inputRef} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={handleKey}
+                placeholder="Escribe tu pregunta... (Enter para enviar)"
+                rows={1} disabled={loading}
+                className="flex-1 bg-surface border border-border rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] resize-none disabled:opacity-50"
+                style={{maxHeight:'120px'}}/>
+              <button onClick={()=>sendMessage(input)} disabled={!input.trim()||loading}
+                className={`px-4 rounded-xl font-bold text-sm transition-all shrink-0 ${
+                  !input.trim()||loading ? 'bg-[#3d4266] text-muted cursor-not-allowed' : 'bg-brand-blue hover:bg-[#3d7de0] text-white active:scale-95'
+                }`}>
+                ➤
+              </button>
+            </div>
+            <p className="text-xs text-muted mt-1.5 text-center opacity-50">Gemini 1.5 Flash · Tus datos financieros se envían como contexto</p>
+          </div>
+        </div>
+      );
+    }
+
+    /* ── Header (con usuario + logout) ──────────────────────────────────── */
+    function Header({ rates, onRefresh, loadingRates, tab, setTab, username, onLogout }) {
+      const tabs = [
+        {id:'dashboard',    label:'Dashboard'},
+        {id:'transactions', label:'Movimientos'},
+        {id:'savings',      label:'Ahorros USDT'},
+        {id:'ai',           label:'✨ Asistente IA'},
+      ];
+      return (
+        <header className="bg-surface border-b border-border sticky top-0 z-30">
+          <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-3 flex-wrap">
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="text-lg">💰</span>
+              <span className="text-white font-black text-base tracking-tight">MisFinanzas</span>
+            </div>
+
+            {/* Tasas */}
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 bg-surface-2 border border-border rounded-lg px-3 py-1.5">
+                <span className="text-[10px] text-muted uppercase tracking-wider font-bold">BCV</span>
+                <span className={`text-sm font-black text-brand-yellow ${loadingRates?'opacity-40':''}`}>{fmtRate(rates?.bcv)}</span>
+                <span className="text-[10px] text-muted">Bs/$</span>
+              </div>
+              <div className="flex items-center gap-1.5 bg-surface-2 border border-brand-yellow/20 rounded-lg px-3 py-1.5">
+                <span className="text-[10px] text-muted uppercase tracking-wider font-bold">Binance P2P</span>
+                <span className={`text-sm font-black text-brand-yellow ${loadingRates?'opacity-40':''}`}>{fmtRate(rates?.binance_p2p)}</span>
+                <span className="text-[10px] text-muted">Bs/USDT</span>
+              </div>
+              <button onClick={onRefresh}
+                className={`text-muted hover:text-white bg-surface-2 border border-border rounded-lg px-2.5 py-1.5 text-base transition-all hover:border-brand-blue ${loadingRates?'spin':''}`}>
+                ↻
+              </button>
+            </div>
+
+            {/* Nav */}
+            <nav className="flex gap-1 ml-auto">
+              {tabs.map(t=>(
+                <button key={t.id} onClick={()=>setTab(t.id)}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-all ${
+                    tab===t.id?'bg-brand-blue text-white':'text-muted hover:text-white hover:bg-surface-2'
+                  }`}>{t.label}</button>
+              ))}
+            </nav>
+
+            {/* Usuario */}
+            <div className="flex items-center gap-2 pl-2 border-l border-border ml-1">
+              <div className="w-7 h-7 bg-brand-blue/20 rounded-full flex items-center justify-center text-xs font-bold text-brand-blue uppercase">
+                {username?.[0] || '?'}
+              </div>
+              <span className="text-sm text-white font-medium hidden sm:block">{username}</span>
+              <button onClick={onLogout}
+                title="Cerrar sesión"
+                className="text-muted hover:text-brand-red transition-colors text-xs px-2 py-1 rounded-lg hover:bg-brand-red/10 ml-1">
+                Salir
+              </button>
+            </div>
+          </div>
+        </header>
+      );
+    }
+
+    /* ── App principal ───────────────────────────────────────────────────── */
+    function App() {
+      const [token,        setToken]        = useState(()=>localStorage.getItem(LS_TOKEN));
+      const [username,     setUsername]     = useState(()=>localStorage.getItem(LS_USER));
+      const [tab,          setTab]          = useState('dashboard');
+      const [rates,        setRates]        = useState(null);
+      const [transactions, setTransactions] = useState([]);
+      const [summary,      setSummary]      = useState(null);
+      const [flow,         setFlow]         = useState(null);
+      const [loadingRates, setLoadingRates] = useState(false);
+      const { show:toast, ToastContainer } = useToast();
+
+      const handleLogout = useCallback(() => {
+        localStorage.removeItem(LS_TOKEN);
+        localStorage.removeItem(LS_USER);
+        setToken(null); setUsername(null);
+        setTransactions([]); setSummary(null); setFlow(null);
+      }, []);
+
+      const api = useCallback(()=>{
+        if(!token) return null;
+        return makeApi(token, handleLogout);
+      }, [token, handleLogout]);
+
+      const loadData = useCallback(async () => {
+        const a = api(); if(!a) return;
+        await Promise.all([
+          a.getTransactions().then(setTransactions).catch(()=>{}),
+          a.getSummary().then(setSummary).catch(()=>{}),
+          a.getFlow().then(setFlow).catch(()=>{}),
+        ]);
+      }, [api]);
+
+      const loadRates = useCallback(async (silent=false) => {
+        const a = api(); if(!a) return;
+        setLoadingRates(true);
+        try {
+          const data = await a.getRates();
+          setRates(data);
+          if(!silent) toast('Tasas actualizadas','success');
+        } catch { if(!silent) toast('Error al obtener tasas','error'); }
+        finally { setLoadingRates(false); }
+      }, [api]);
+
+      const handleAuth = ({ token:t, username:u }) => {
+        localStorage.setItem(LS_TOKEN, t);
+        localStorage.setItem(LS_USER,  u);
+        setToken(t); setUsername(u);
+      };
+
+      const handleAdd = async data => {
+        const a = api(); if(!a) return;
+        try { await a.add(data); await loadData(); toast('Movimiento registrado ✓','success'); }
+        catch(e) { toast('Error al guardar','error'); throw e; }
+      };
+
+      const handleDelete = async id => {
+        if(!confirm('¿Eliminar este movimiento?')) return;
+        const a = api(); if(!a) return;
+        try { await a.del(id); await loadData(); toast('Movimiento eliminado','success'); }
+        catch { toast('Error al eliminar','error'); }
+      };
+
+      // Verificar token al cargar + cargar datos
+      useEffect(() => {
+        if(!token) return;
+        const a = makeApi(token, handleLogout);
+        a.verifyToken().then(user => {
+          if(!user) { handleLogout(); return; }
+          setUsername(user.username);
+          loadRates(true);
+          loadData();
+        });
+      }, [token]);
+
+      if(!token) return <AuthScreen onAuth={handleAuth}/>;
+
+      return (
+        <div className="min-h-screen bg-[#0f1117] text-white">
+          <Header
+            rates={rates} onRefresh={()=>loadRates(false)}
+            loadingRates={loadingRates} tab={tab} setTab={setTab}
+            username={username} onLogout={handleLogout}
+          />
+          <main className="max-w-7xl mx-auto px-4 py-6">
+            {tab==='dashboard'    && <DashboardTab    summary={summary} flow={flow} rates={rates}/>}
+            {tab==='transactions' && <TransactionsTab transactions={transactions} rates={rates} onAdd={handleAdd} onDelete={handleDelete}/>}
+            {tab==='savings'      && <SavingsTab      summary={summary} rates={rates} transactions={transactions}/>}
+            {tab==='ai'           && <AITab           token={token}/>}
+          </main>
+          <ToastContainer/>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
