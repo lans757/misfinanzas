@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 
 # ── Rate Limiter ──────────────────────────────────────────────────────────────
+# hola
 limiter = Limiter(key_func=get_remote_address)
 
 # ── Clave secreta persistente ─────────────────────────────────────────────────
