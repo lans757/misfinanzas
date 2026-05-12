@@ -2,9 +2,9 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
-from passlib.context import CryptContext
+import bcrypt as _bcrypt
 from jose import JWTError, jwt
 from google import genai
 from google.genai import types as gtypes
@@ -67,8 +67,11 @@ def _get_genai_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
 # ── Base de datos ─────────────────────────────────────────────────────────────
-DATABASE_URL = "sqlite:///./finanzas.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "mysql+pymysql://root:@localhost/misfinanzas"
+)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -79,8 +82,8 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
     id              = Column(Integer, primary_key=True, index=True)
-    username        = Column(String, unique=True, nullable=False, index=True)
-    hashed_password = Column(String, nullable=False)
+    username        = Column(String(150), unique=True, nullable=False, index=True)
+    hashed_password = Column(String(255), nullable=False)
     created_at      = Column(DateTime, default=datetime.now)
 
 
@@ -89,18 +92,18 @@ class Transaction(Base):
     id                   = Column(Integer, primary_key=True, index=True)
     user_id              = Column(Integer, nullable=True)   # FK a users.id
     date                 = Column(DateTime, default=datetime.now)
-    description          = Column(String, nullable=False)
-    category             = Column(String, nullable=False)
-    type                 = Column(String, nullable=False)   # ingreso | gasto
+    description          = Column(String(500), nullable=False)
+    category             = Column(String(100), nullable=False)
+    type                 = Column(String(20), nullable=False)   # ingreso | gasto
     amount               = Column(Float, nullable=False)
-    currency             = Column(String, nullable=False, default="VES")
-    payment_method       = Column(String, nullable=True)
+    currency             = Column(String(10), nullable=False, default="VES")
+    payment_method       = Column(String(100), nullable=True)
     exchange_rate_bcv    = Column(Float, nullable=True)
     exchange_rate_binance= Column(Float, nullable=True)
     amount_ves           = Column(Float, nullable=False)
     amount_usd           = Column(Float, nullable=True)
     amount_usdt          = Column(Float, nullable=True)
-    notes                = Column(String, nullable=True)
+    notes                = Column(Text, nullable=True)
 
 
 Base.metadata.create_all(bind=engine)
@@ -108,7 +111,7 @@ Base.metadata.create_all(bind=engine)
 # ── Migración: agregar user_id si no existe ───────────────────────────────────
 with engine.connect() as _conn:
     try:
-        _conn.execute(text("ALTER TABLE transactions ADD COLUMN user_id INTEGER"))
+        _conn.execute(text("ALTER TABLE transactions ADD COLUMN user_id INT"))
         _conn.commit()
     except Exception:
         pass  # columna ya existe
@@ -123,16 +126,15 @@ def get_db():
 
 
 # ── Utilidades de autenticación ───────────────────────────────────────────────
-pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return _bcrypt.checkpw(plain.encode(), hashed.encode())
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
 
 
 def create_token(username: str) -> str:
@@ -570,7 +572,7 @@ async def ai_chat(
         ))
 
         response = client.models.generate_content(
-            model    = "gemini-1.5-flash",
+            model    = "gemini-2.0-flash",
             contents = contents,
             config   = gtypes.GenerateContentConfig(
                 system_instruction = system_prompt,

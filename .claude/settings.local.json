@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 /f/usuario/Documents/Proyectos/misfinanzas/misfinanzas/finanzas.db \".schema\")",
+      "Bash(python3 -c \"import sqlite3; conn=sqlite3.connect\\('/f/usuario/Documents/Proyectos/misfinanzas/misfinanzas/finanzas.db'\\); cursor=conn.cursor\\(\\); cursor.execute\\(\\\\\"SELECT name FROM sqlite_master WHERE type='table';\\\\\"\\); print\\('\\\\n'.join\\([t[0] for t in cursor.fetchall\\(\\)]\\)\\)\")",
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(curl -s http://localhost:8000/api/rates)",
+      "Bash(pkill -f uvicorn)",
+      "Bash(python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload)",
+      "Bash(curl -s -X POST http://localhost:8000/api/auth/register -H \"Content-Type: application/json\" -d '{\"username\":\"test\",\"password\":\"123456\"}')",
+      "Bash(curl -s -X POST http://localhost:8000/api/auth/register -H \"Content-Type: application/json\" -d '{\"username\":\"testuser\",\"password\":\"123456\"}')",
+      "Bash(python -c \"import app\")",
+      "Bash(python -m uvicorn app:app --host 0.0.0.0 --port 8001)",
+      "Bash(curl -s -X POST http://localhost:8001/api/auth/register -H \"Content-Type: application/json\" -d '{\"username\":\"testuser2\",\"password\":\"123456\"}')",
+      "Bash(taskkill /F /IM python.exe)",
+      "Bash(curl -s -X POST http://localhost:8000/api/auth/register -H \"Content-Type: application/json\" -d '{\"username\":\"leo\",\"password\":\"123456\"}')",
+      "Bash(powershell -Command \"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.openclaw.ai)"
+    ]
+  }
+}

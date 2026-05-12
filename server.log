@@ -1,0 +1,43 @@
+INFO:     Will watch for changes in these directories: ['F:\\usuario\\Documents\\Proyectos\\misfinanzas\\misfinanzas']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [12916] using WatchFiles
+INFO:     Started server process [13200]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:55686 - "POST /api/auth/register HTTP/1.1" 201 Created
+INFO:     127.0.0.1:55729 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55730 - "POST /api/auth/register HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:55734 - "POST /api/auth/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55734 - "GET /api/auth/me HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55748 - "GET /api/summary HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55749 - "GET /api/monthly-flow HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55747 - "GET /api/transactions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55734 - "GET /api/rates HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55767 - "POST /api/transactions HTTP/1.1" 201 Created
+INFO:     127.0.0.1:55767 - "GET /api/transactions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55767 - "GET /api/summary HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55767 - "GET /api/monthly-flow HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55770 - "POST /api/transactions HTTP/1.1" 201 Created
+INFO:     127.0.0.1:55770 - "GET /api/transactions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55771 - "GET /api/summary HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55772 - "GET /api/monthly-flow HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55785 - "GET /api/ai/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55860 - "POST /api/transactions HTTP/1.1" 201 Created
+INFO:     127.0.0.1:55860 - "GET /api/transactions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55860 - "GET /api/summary HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55860 - "GET /api/monthly-flow HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56327 - "GET /api/ai/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56434 - "POST /api/ai/key HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56434 - "POST /api/ai/chat HTTP/1.1" 500 Internal Server Error
+INFO:     127.0.0.1:57440 - "POST /api/transactions HTTP/1.1" 201 Created
+INFO:     127.0.0.1:57440 - "GET /api/transactions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57440 - "GET /api/summary HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57440 - "GET /api/monthly-flow HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57443 - "POST /api/transactions HTTP/1.1" 201 Created
+INFO:     127.0.0.1:57443 - "GET /api/transactions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57444 - "GET /api/summary HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57445 - "GET /api/monthly-flow HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57533 - "GET /api/ai/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57533 - "POST /api/ai/chat HTTP/1.1" 500 Internal Server Error
+WARNING:  WatchFiles detected changes in 'app.py'. Reloading...
+ 
