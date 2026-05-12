@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text, func
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
@@ -14,6 +14,8 @@ from slowapi.errors import RateLimitExceeded
 from typing import Literal
 import httpx
 import asyncio
+import csv
+import io
 import secrets
 import os
 from pathlib import Path
@@ -22,7 +24,6 @@ from pydantic import BaseModel
 from typing import Optional, List
 
 # ── Rate Limiter ──────────────────────────────────────────────────────────────
-# hola
 limiter = Limiter(key_func=get_remote_address)
 
 # ── Clave secreta persistente ─────────────────────────────────────────────────
@@ -35,10 +36,10 @@ else:
     with open(_KEY_FILE, "w") as f:
         f.write(SECRET_KEY)
 
-ALGORITHM        = "HS256"
+ALGORITHM         = "HS256"
 TOKEN_EXPIRE_DAYS = 30
 
-# ── Gemini API Key (cargado desde .env) ───────────────────────────────────────
+# ── Gemini API Key ────────────────────────────────────────────────────────────
 def _load_env():
     env = Path(".env")
     if env.exists():
@@ -54,17 +55,19 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 def _save_gemini_key(key: str):
     global GEMINI_API_KEY
-    env = Path(".env")
-    lines = env.read_text().splitlines() if env.exists() else []
-    updated = False
-    for i, line in enumerate(lines):
-        if line.startswith("GEMINI_API_KEY="):
-            lines[i] = f"GEMINI_API_KEY={key}"
-            updated = True
-            break
-    if not updated:
-        lines.append(f"GEMINI_API_KEY={key}")
-    env.write_text("\n".join(lines) + "\n")
+    # En producción (DATABASE_URL externo) no escribir al disco
+    if not os.environ.get("DATABASE_URL"):
+        env = Path(".env")
+        lines = env.read_text().splitlines() if env.exists() else []
+        updated = False
+        for i, line in enumerate(lines):
+            if line.startswith("GEMINI_API_KEY="):
+                lines[i] = f"GEMINI_API_KEY={key}"
+                updated = True
+                break
+        if not updated:
+            lines.append(f"GEMINI_API_KEY={key}")
+        env.write_text("\n".join(lines) + "\n")
     GEMINI_API_KEY = key
     os.environ["GEMINI_API_KEY"] = key
 
@@ -75,10 +78,8 @@ def _get_genai_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
 # ── Base de datos ─────────────────────────────────────────────────────────────
-# ── Detecta automáticamente SQLite (local) o PostgreSQL (Render/Supabase/Neon) ────
 _RAW_DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./finanzas.db")
 
-# Render/Heroku/Neon entregan "postgres://..." pero SQLAlchemy 2.x requiere "postgresql://"
 if _RAW_DB_URL.startswith("postgres://"):
     _RAW_DB_URL = _RAW_DB_URL.replace("postgres://", "postgresql://", 1)
 
@@ -91,6 +92,13 @@ engine = create_engine(
     connect_args={"check_same_thread": False} if _is_sqlite else {},
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def month_label(col):
+    """Expresión YYYY-MM compatible con SQLite y PostgreSQL."""
+    if _is_sqlite:
+        return func.strftime("%Y-%m", col)
+    return func.to_char(col, "YYYY-MM")
 
 
 class Base(DeclarativeBase):
@@ -106,36 +114,68 @@ class User(Base):
 
 
 class Transaction(Base):
-    __tablename__        = "transactions"
-    id                   = Column(Integer, primary_key=True, index=True)
-    user_id              = Column(Integer, nullable=True)   # FK a users.id
-    date                 = Column(DateTime, default=datetime.now)
-    description          = Column(String(500), nullable=False)
-    category             = Column(String(100), nullable=False)
-    type                 = Column(String(20), nullable=False)   # ingreso | gasto
-    amount               = Column(Float, nullable=False)
-    currency             = Column(String(10), nullable=False, default="VES")
-    payment_method       = Column(String(100), nullable=True)
-    exchange_rate_bcv    = Column(Float, nullable=True)
-    exchange_rate_binance= Column(Float, nullable=True)
-    amount_ves           = Column(Float, nullable=False)
-    amount_usd           = Column(Float, nullable=True)
-    amount_usdt          = Column(Float, nullable=True)
-    notes                = Column(Text, nullable=True)
+    __tablename__         = "transactions"
+    id                    = Column(Integer, primary_key=True, index=True)
+    user_id               = Column(Integer, nullable=True)
+    date                  = Column(DateTime, default=datetime.now)
+    description           = Column(String(500), nullable=False)
+    category              = Column(String(100), nullable=False)
+    type                  = Column(String(20), nullable=False)
+    amount                = Column(Float, nullable=False)
+    currency              = Column(String(10), nullable=False, default="VES")
+    payment_method        = Column(String(100), nullable=True)
+    exchange_rate_bcv     = Column(Float, nullable=True)
+    exchange_rate_binance = Column(Float, nullable=True)
+    amount_ves            = Column(Float, nullable=False)
+    amount_usd            = Column(Float, nullable=True)
+    amount_usdt           = Column(Float, nullable=True)
+    notes                 = Column(Text, nullable=True)
+    tags                  = Column(String(500), nullable=True)
+
+
+class Goal(Base):
+    __tablename__ = "goals"
+    id            = Column(Integer, primary_key=True, index=True)
+    user_id       = Column(Integer, nullable=False, index=True)
+    name          = Column(String(200), nullable=False)
+    target_usdt   = Column(Float, nullable=False)
+    notes         = Column(Text, nullable=True)
+    created_at    = Column(DateTime, default=datetime.now)
+
+
+class RateHistory(Base):
+    __tablename__ = "rate_history"
+    id            = Column(Integer, primary_key=True, index=True)
+    date          = Column(DateTime, default=datetime.now, index=True)
+    bcv           = Column(Float, nullable=True)
+    binance_p2p   = Column(Float, nullable=True)
+
+
+class BudgetAlert(Base):
+    __tablename__ = "budget_alerts"
+    id            = Column(Integer, primary_key=True, index=True)
+    user_id       = Column(Integer, nullable=False, index=True)
+    category      = Column(String(100), nullable=False)
+    limit_ves     = Column(Float, nullable=False)
+    active        = Column(Integer, default=1)
 
 
 Base.metadata.create_all(bind=engine)
 
-# ── Migración: agregar user_id si no existe (solo SQLite) ────────────────────
+# ── Migraciones SQLite: columnas nuevas en tablas existentes ──────────────────
 from sqlalchemy.exc import OperationalError
 if _is_sqlite:
     with engine.connect() as _conn:
-        try:
-            _conn.execute(text("ALTER TABLE transactions ADD COLUMN user_id INTEGER"))
-            _conn.commit()
-        except OperationalError as e:
-            if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
-                raise
+        for _stmt in [
+            "ALTER TABLE transactions ADD COLUMN user_id INTEGER",
+            "ALTER TABLE transactions ADD COLUMN tags TEXT",
+        ]:
+            try:
+                _conn.execute(text(_stmt))
+                _conn.commit()
+            except OperationalError as e:
+                if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
+                    raise
 
 
 def get_db():
@@ -158,14 +198,13 @@ def hash_password(password: str) -> str:
     return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
 
 
-# CORREGIDO: datetime.utcnow() -> datetime.now(timezone.utc)
 def create_token(username: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRE_DAYS)
     return jwt.encode({"sub": username, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
 
 
 async def get_current_user(
-    token: str    = Depends(oauth2_scheme),
+    token: str     = Depends(oauth2_scheme),
     db:    Session = Depends(get_db),
 ) -> User:
     try:
@@ -240,18 +279,17 @@ class LoginRequest(BaseModel):
 class TransactionCreate(BaseModel):
     description:           str
     category:              str
-    # CORREGIDO: Literal valida que solo sean "ingreso" o "gasto"
     type:                  Literal["ingreso", "gasto"]
     amount:                float
-    currency:              str = "VES"
+    currency:              str            = "VES"
     payment_method:        Optional[str]      = None
     exchange_rate_bcv:     Optional[float]    = None
     exchange_rate_binance: Optional[float]    = None
     notes:                 Optional[str]      = None
     date:                  Optional[datetime] = None
+    tags:                  Optional[str]      = None
 
 
-# NUEVO: Schema para editar transacciones (PUT)
 class TransactionUpdate(BaseModel):
     description:           Optional[str]      = None
     category:              Optional[str]      = None
@@ -263,6 +301,7 @@ class TransactionUpdate(BaseModel):
     exchange_rate_binance: Optional[float]    = None
     notes:                 Optional[str]      = None
     date:                  Optional[datetime] = None
+    tags:                  Optional[str]      = None
 
 
 class TransactionOut(BaseModel):
@@ -280,6 +319,35 @@ class TransactionOut(BaseModel):
     amount_usd:            Optional[float]
     amount_usdt:           Optional[float]
     notes:                 Optional[str]
+    tags:                  Optional[str]
+    model_config = {"from_attributes": True}
+
+
+class GoalCreate(BaseModel):
+    name:        str
+    target_usdt: float
+    notes:       Optional[str] = None
+
+
+class GoalOut(BaseModel):
+    id:          int
+    name:        str
+    target_usdt: float
+    notes:       Optional[str]
+    created_at:  datetime
+    model_config = {"from_attributes": True}
+
+
+class BudgetAlertCreate(BaseModel):
+    category:  str
+    limit_ves: float
+
+
+class BudgetAlertOut(BaseModel):
+    id:        int
+    category:  str
+    limit_ves: float
+    active:    int
     model_config = {"from_attributes": True}
 
 
@@ -291,7 +359,6 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 @app.post("/api/auth/register", status_code=201)
-# CORREGIDO: rate limit — máx 5 registros por minuto por IP
 @limiter.limit("5/minute")
 def register(request: Request, body: RegisterRequest, db: Session = Depends(get_db)):
     username = body.username.strip().lower()
@@ -313,7 +380,6 @@ def register(request: Request, body: RegisterRequest, db: Session = Depends(get_
 
 
 @app.post("/api/auth/login")
-# CORREGIDO: rate limit — máx 10 intentos por minuto por IP (anti fuerza bruta)
 @limiter.limit("10/minute")
 def login(request: Request, body: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == body.username.strip().lower()).first()
@@ -337,14 +403,19 @@ def me(current_user: User = Depends(get_current_user)):
 
 # ── Tasas (pública) ───────────────────────────────────────────────────────────
 @app.get("/api/rates")
-async def get_rates():
+async def get_rates(db: Session = Depends(get_db)):
     bcv, binance = await asyncio.gather(fetch_bcv_rate(), fetch_binance_p2p_rate())
+    if bcv or binance:
+        db.add(RateHistory(bcv=bcv, binance_p2p=binance))
+        db.commit()
     return {"bcv": bcv, "binance_p2p": binance, "timestamp": datetime.now().isoformat()}
 
 
 # ── Transacciones (protegidas) ────────────────────────────────────────────────
 @app.get("/api/transactions", response_model=List[TransactionOut])
 def list_transactions(
+    skip:         int     = Query(0, ge=0),
+    limit:        int     = Query(500, ge=1, le=2000),
     db:           Session = Depends(get_db),
     current_user: User    = Depends(get_current_user),
 ):
@@ -352,6 +423,7 @@ def list_transactions(
         db.query(Transaction)
         .filter(Transaction.user_id == current_user.id)
         .order_by(Transaction.date.desc())
+        .offset(skip).limit(limit)
         .all()
     )
 
@@ -389,20 +461,21 @@ def create_transaction(
             amount_usdt = amount_ves / body.exchange_rate_binance
 
     t = Transaction(
-        user_id              = current_user.id,
-        date                 = body.date or datetime.now(),
-        description          = body.description,
-        category             = body.category,
-        type                 = body.type,
-        amount               = body.amount,
-        currency             = body.currency,
-        payment_method       = body.payment_method,
-        exchange_rate_bcv    = body.exchange_rate_bcv,
-        exchange_rate_binance= body.exchange_rate_binance,
-        amount_ves           = amount_ves,
-        amount_usd           = amount_usd,
-        amount_usdt          = amount_usdt,
-        notes                = body.notes,
+        user_id               = current_user.id,
+        date                  = body.date or datetime.now(),
+        description           = body.description,
+        category              = body.category,
+        type                  = body.type,
+        amount                = body.amount,
+        currency              = body.currency,
+        payment_method        = body.payment_method,
+        exchange_rate_bcv     = body.exchange_rate_bcv,
+        exchange_rate_binance = body.exchange_rate_binance,
+        amount_ves            = amount_ves,
+        amount_usd            = amount_usd,
+        amount_usdt           = amount_usdt,
+        notes                 = body.notes,
+        tags                  = body.tags,
     )
     db.add(t)
     db.commit()
@@ -410,7 +483,6 @@ def create_transaction(
     return t
 
 
-# NUEVO: endpoint PUT para editar transacciones
 @app.put("/api/transactions/{tid}", response_model=TransactionOut)
 def update_transaction(
     tid:          int,
@@ -429,7 +501,6 @@ def update_transaction(
     for field, value in body.model_dump(exclude_unset=True).items():
         setattr(t, field, value)
 
-    # Recalcular montos si cambiaron campos relevantes
     currency = t.currency
     amount   = t.amount
     bcv      = t.exchange_rate_bcv
@@ -471,14 +542,13 @@ def delete_transaction(
     return {"ok": True}
 
 
-# CORREGIDO: get_summary usa func.sum() en SQL, no Python en memoria
 @app.get("/api/summary")
 def get_summary(
     db:           Session = Depends(get_db),
     current_user: User    = Depends(get_current_user),
 ):
-    uid = current_user.id
-    now = datetime.now()
+    uid       = current_user.id
+    cur_month = datetime.now().strftime("%Y-%m")
 
     def q_sum(type_: str, col=Transaction.amount_ves):
         return db.query(func.coalesce(func.sum(col), 0.0)) \
@@ -495,16 +565,14 @@ def get_summary(
 
     monthly_ingresos = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
         .filter(Transaction.user_id == uid, Transaction.type == "ingreso",
-                func.strftime("%Y-%m", Transaction.date) == now.strftime("%Y-%m")).scalar()
+                month_label(Transaction.date) == cur_month).scalar()
     monthly_gastos   = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
         .filter(Transaction.user_id == uid, Transaction.type == "gasto",
-                func.strftime("%Y-%m", Transaction.date) == now.strftime("%Y-%m")).scalar()
+                month_label(Transaction.date) == cur_month).scalar()
 
-    # Categorías: solo gastos, agrupados en SQL
     cat_rows = db.query(Transaction.category, func.sum(Transaction.amount_ves)) \
         .filter(Transaction.user_id == uid, Transaction.type == "gasto") \
         .group_by(Transaction.category).all()
-    categories = {row[0]: row[1] for row in cat_rows}
 
     return {
         "total_ingresos_ves": total_ingresos,
@@ -513,19 +581,18 @@ def get_summary(
         "usdt_balance":       usdt_ingresos - usdt_gastos,
         "monthly_ingresos":   monthly_ingresos,
         "monthly_gastos":     monthly_gastos,
-        "categories":         categories,
+        "categories":         {row[0]: row[1] for row in cat_rows},
     }
 
 
-# CORREGIDO: get_monthly_flow también usa SQL, no Python en memoria
 @app.get("/api/monthly-flow")
 def get_monthly_flow(
     db:           Session = Depends(get_db),
     current_user: User    = Depends(get_current_user),
 ):
-    uid = current_user.id
+    uid  = current_user.id
     rows = db.query(
-        func.strftime("%Y-%m", Transaction.date).label("month"),
+        month_label(Transaction.date).label("month"),
         Transaction.type,
         func.sum(Transaction.amount_ves).label("total"),
     ).filter(Transaction.user_id == uid) \
@@ -552,7 +619,7 @@ def get_monthly_flow(
 
 # ── Asistente IA (Gemini) ─────────────────────────────────────────────────────
 class ChatMessage(BaseModel):
-    role:    str   # "user" | "assistant"
+    role:    str
     content: str
 
 
@@ -564,7 +631,6 @@ class GeminiKeyRequest(BaseModel):
     api_key: str
 
 
-# CORREGIDO: _build_system_prompt recibe datos pre-calculados, no filas brutas
 def _build_system_prompt(username: str, summary: dict, last_txns: list, rates: dict) -> str:
     saldo      = summary["saldo_ves"]
     bcv_rate   = rates.get("bcv")
@@ -580,7 +646,6 @@ def _build_system_prompt(username: str, summary: dict, last_txns: list, rates: d
         for k, v in sorted(summary["categories"].items(), key=lambda x: -x[1])[:8]
     ) or "  Sin datos"
 
-    # CORREGIDO: variable 'history' eliminada (era código muerto); se usa 'contents' directamente
     txns_str = "\n".join(
         f"  {'↑' if t['type']=='ingreso' else '↓'} {t['date']} | {t['category']} | {t['description']} | Bs {t['amount_ves']:,.2f}"
         for t in last_txns
@@ -644,32 +709,34 @@ async def ai_chat(
     if not body.messages:
         raise HTTPException(400, "Sin mensajes")
 
-    # CORREGIDO: obtener datos financieros via SQL (no cargar todas las filas)
-    uid = current_user.id
+    uid       = current_user.id
+    cur_month = datetime.now().strftime("%Y-%m")
 
-    def q_sum(type_: str, col=Transaction.amount_ves):
-        return db.query(func.coalesce(func.sum(col), 0.0)) \
-                 .filter(Transaction.user_id == uid, Transaction.type == type_).scalar()
+    total_ingresos = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "ingreso").scalar()
+    total_gastos   = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "gasto").scalar()
 
-    now = datetime.now()
     usdt_i = db.query(func.coalesce(func.sum(Transaction.amount), 0.0)) \
         .filter(Transaction.user_id == uid, Transaction.type == "ingreso", Transaction.currency == "USDT").scalar()
     usdt_g = db.query(func.coalesce(func.sum(Transaction.amount), 0.0)) \
         .filter(Transaction.user_id == uid, Transaction.type == "gasto",   Transaction.currency == "USDT").scalar()
+
     m_i = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
         .filter(Transaction.user_id == uid, Transaction.type == "ingreso",
-                func.strftime("%Y-%m", Transaction.date) == now.strftime("%Y-%m")).scalar()
+                month_label(Transaction.date) == cur_month).scalar()
     m_g = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
         .filter(Transaction.user_id == uid, Transaction.type == "gasto",
-                func.strftime("%Y-%m", Transaction.date) == now.strftime("%Y-%m")).scalar()
+                month_label(Transaction.date) == cur_month).scalar()
+
     cat_rows = db.query(Transaction.category, func.sum(Transaction.amount_ves)) \
         .filter(Transaction.user_id == uid, Transaction.type == "gasto") \
         .group_by(Transaction.category).all()
 
     summary = {
-        "total_ingresos_ves": q_sum("ingreso"),
-        "total_gastos_ves":   q_sum("gasto"),
-        "saldo_ves":          q_sum("ingreso") - q_sum("gasto"),
+        "total_ingresos_ves": total_ingresos,
+        "total_gastos_ves":   total_gastos,
+        "saldo_ves":          total_ingresos - total_gastos,
         "usdt_balance":       usdt_i - usdt_g,
         "monthly_ingresos":   m_i,
         "monthly_gastos":     m_g,
@@ -686,13 +753,11 @@ async def ai_chat(
     ]
 
     bcv, binance = await asyncio.gather(fetch_bcv_rate(), fetch_binance_p2p_rate())
-    rates = {"bcv": bcv, "binance_p2p": binance}
-
+    rates        = {"bcv": bcv, "binance_p2p": binance}
     system_prompt = _build_system_prompt(current_user.username, summary, last_txns, rates)
 
     try:
         client   = _get_genai_client()
-        # CORREGIDO: variable 'history' (código muerto) eliminada, se usa 'contents' directamente
         contents = []
         for msg in body.messages[:-1]:
             contents.append(gtypes.Content(
@@ -723,6 +788,121 @@ async def ai_chat(
         if "quota" in err.lower() or "429" in err:
             raise HTTPException(429, "Límite de uso de Gemini alcanzado. Intenta en unos minutos.")
         raise HTTPException(500, f"Error de Gemini: {err[:200]}")
+
+
+# ── Metas de ahorro ───────────────────────────────────────────────────────────
+@app.get("/api/goals", response_model=List[GoalOut])
+def list_goals(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return db.query(Goal).filter(Goal.user_id == current_user.id).all()
+
+
+@app.post("/api/goals", response_model=GoalOut, status_code=201)
+def create_goal(body: GoalCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    g = Goal(user_id=current_user.id, name=body.name, target_usdt=body.target_usdt, notes=body.notes)
+    db.add(g)
+    db.commit()
+    db.refresh(g)
+    return g
+
+
+@app.delete("/api/goals/{gid}")
+def delete_goal(gid: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    g = db.query(Goal).filter(Goal.id == gid, Goal.user_id == current_user.id).first()
+    if not g:
+        raise HTTPException(404, "Meta no encontrada")
+    db.delete(g)
+    db.commit()
+    return {"ok": True}
+
+
+# ── Historial de tasas ────────────────────────────────────────────────────────
+@app.get("/api/rates/history")
+def get_rates_history(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    rows = db.query(RateHistory).order_by(RateHistory.date.desc()).limit(30).all()
+    return [
+        {"date": r.date.isoformat(), "bcv": r.bcv, "binance_p2p": r.binance_p2p}
+        for r in reversed(rows)
+    ]
+
+
+# ── Alertas de presupuesto ────────────────────────────────────────────────────
+@app.get("/api/budget-alerts", response_model=List[BudgetAlertOut])
+def list_budget_alerts(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return db.query(BudgetAlert).filter(BudgetAlert.user_id == current_user.id).all()
+
+
+@app.get("/api/budget-alerts/check")
+def check_budget_alerts(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    uid       = current_user.id
+    cur_month = datetime.now().strftime("%Y-%m")
+    alerts    = db.query(BudgetAlert).filter(BudgetAlert.user_id == uid, BudgetAlert.active == 1).all()
+    results   = []
+    for alert in alerts:
+        spent = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
+            .filter(
+                Transaction.user_id == uid,
+                Transaction.type    == "gasto",
+                Transaction.category == alert.category,
+                month_label(Transaction.date) == cur_month,
+            ).scalar()
+        results.append({
+            "id":        alert.id,
+            "category":  alert.category,
+            "limit_ves": alert.limit_ves,
+            "spent_ves": spent,
+            "triggered": spent >= alert.limit_ves,
+            "pct":       round(spent / alert.limit_ves * 100, 1) if alert.limit_ves else 0,
+        })
+    return results
+
+
+@app.post("/api/budget-alerts", response_model=BudgetAlertOut, status_code=201)
+def create_budget_alert(body: BudgetAlertCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    a = BudgetAlert(user_id=current_user.id, category=body.category, limit_ves=body.limit_ves)
+    db.add(a)
+    db.commit()
+    db.refresh(a)
+    return a
+
+
+@app.delete("/api/budget-alerts/{aid}")
+def delete_budget_alert(aid: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    a = db.query(BudgetAlert).filter(BudgetAlert.id == aid, BudgetAlert.user_id == current_user.id).first()
+    if not a:
+        raise HTTPException(404, "Alerta no encontrada")
+    db.delete(a)
+    db.commit()
+    return {"ok": True}
+
+
+# ── Exportar a CSV ────────────────────────────────────────────────────────────
+@app.get("/api/export/csv")
+def export_csv(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    txns = (
+        db.query(Transaction)
+        .filter(Transaction.user_id == current_user.id)
+        .order_by(Transaction.date.desc())
+        .all()
+    )
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Fecha", "Tipo", "Categoría", "Descripción",
+        "Monto", "Moneda", "Monto Bs", "Monto USD", "Monto USDT",
+        "Método de pago", "Tasa BCV", "Tasa Binance", "Notas", "Tags",
+    ])
+    for t in txns:
+        writer.writerow([
+            t.date.strftime("%Y-%m-%d %H:%M"), t.type, t.category, t.description,
+            t.amount, t.currency, t.amount_ves, t.amount_usd, t.amount_usdt,
+            t.payment_method, t.exchange_rate_bcv, t.exchange_rate_binance, t.notes, t.tags,
+        ])
+    filename = f"misfinanzas_{datetime.now().strftime('%Y%m%d')}.csv"
+    return StreamingResponse(
+        iter(["﻿" + output.getvalue()]),  # BOM para que Excel abra correctamente
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 # ── Frontend ──────────────────────────────────────────────────────────────────

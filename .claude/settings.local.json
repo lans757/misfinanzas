@@ -18,7 +18,9 @@
       "Bash(powershell -Command \"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force\")",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:docs.openclaw.ai)"
+      "WebFetch(domain:docs.openclaw.ai)",
+      "Bash(pandoc --version)",
+      "Bash(python -c \"import weasyprint; print\\('weasyprint ok'\\)\")"
     ]
   }
 }

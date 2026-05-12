@@ -68,23 +68,48 @@
       currency==='USDT' ? fmtUSDT(amount) : currency==='USD' ? fmtUSD(amount) : fmtVES(amount);
     const fmtRate = n => n ? n.toLocaleString('es-VE',{minimumFractionDigits:2,maximumFractionDigits:2}) : '--';
 
-    /* ── API client (recibe token) ──────────────────────────────────────── */
+    /* ── API client ──────────────────────────────────────────────────────── */
     function makeApi(token, onUnauthorized) {
       const h = { 'Authorization': `Bearer ${token}` };
+      const j = { ...h, 'Content-Type': 'application/json' };
       const guard = r => {
         if (r.status===401) { onUnauthorized(); throw new Error('unauthorized'); }
         return r.json();
       };
       return {
         getRates:        () => fetch('/api/rates').then(r=>r.json()),
-        getTransactions: () => fetch('/api/transactions',{headers:h}).then(guard),
+        getRatesHistory: () => fetch('/api/rates/history',{headers:h}).then(guard),
+        getTransactions: (skip=0,limit=500) => fetch(`/api/transactions?skip=${skip}&limit=${limit}`,{headers:h}).then(guard),
         getSummary:      () => fetch('/api/summary',{headers:h}).then(guard),
         getFlow:         () => fetch('/api/monthly-flow',{headers:h}).then(guard),
         verifyToken:     () => fetch('/api/auth/me',{headers:h}).then(r=>r.ok ? r.json() : null),
-        add: data => fetch('/api/transactions',{
-          method:'POST', headers:{...h,'Content-Type':'application/json'}, body:JSON.stringify(data)
-        }).then(async r=>{ if(!r.ok){const e=await r.json();throw e;} return r.json(); }),
-        del: id => fetch(`/api/transactions/${id}`,{method:'DELETE',headers:h}).then(guard),
+        add:  data  => fetch('/api/transactions',{method:'POST',headers:j,body:JSON.stringify(data)})
+                        .then(async r=>{ if(!r.ok){const e=await r.json();throw e;} return r.json(); }),
+        edit: (id,data) => fetch(`/api/transactions/${id}`,{method:'PUT',headers:j,body:JSON.stringify(data)})
+                        .then(async r=>{ if(!r.ok){const e=await r.json();throw e;} return r.json(); }),
+        del:  id    => fetch(`/api/transactions/${id}`,{method:'DELETE',headers:h}).then(guard),
+        exportCSV:   () => {
+          const a = document.createElement('a');
+          a.href = '/api/export/csv';
+          a.setAttribute('download','');
+          // pass token via custom header not possible for direct download — use query param workaround
+          fetch('/api/export/csv',{headers:h})
+            .then(r=>r.blob())
+            .then(blob => {
+              a.href = URL.createObjectURL(blob);
+              a.click();
+              URL.revokeObjectURL(a.href);
+            });
+        },
+        // Goals
+        getGoals:    () => fetch('/api/goals',{headers:h}).then(guard),
+        createGoal:  data => fetch('/api/goals',{method:'POST',headers:j,body:JSON.stringify(data)}).then(async r=>{ if(!r.ok){const e=await r.json();throw e;} return r.json(); }),
+        deleteGoal:  id   => fetch(`/api/goals/${id}`,{method:'DELETE',headers:h}).then(guard),
+        // Budgets
+        getBudgets:    () => fetch('/api/budget-alerts',{headers:h}).then(guard),
+        checkBudgets:  () => fetch('/api/budget-alerts/check',{headers:h}).then(guard),
+        createBudget:  data => fetch('/api/budget-alerts',{method:'POST',headers:j,body:JSON.stringify(data)}).then(async r=>{ if(!r.ok){const e=await r.json();throw e;} return r.json(); }),
+        deleteBudget:  id   => fetch(`/api/budget-alerts/${id}`,{method:'DELETE',headers:h}).then(guard),
       };
     }
 
@@ -164,7 +189,33 @@
       return <div style={{height:220}}><canvas ref={ref}/></div>;
     }
 
-    /* ── Pantalla de Login / Registro ───────────────────────────────────── */
+    function RateHistoryChart({ data }) {
+      const ref = useRef(null); const inst = useRef(null);
+      useEffect(()=>{
+        if(!ref.current||!data?.length) return;
+        if(inst.current) inst.current.destroy();
+        const labels  = data.map(r=>r.timestamp.slice(0,10));
+        inst.current = new Chart(ref.current, {
+          type:'line',
+          data:{ labels, datasets:[
+            {label:'BCV (Bs/$)',     data:data.map(r=>r.bcv),        borderColor:'#4f8ef7',backgroundColor:'#4f8ef710',fill:true,tension:.3,pointRadius:2},
+            {label:'Binance (Bs/₮)',data:data.map(r=>r.binance_p2p),borderColor:'#f7c94f',backgroundColor:'#f7c94f10',fill:true,tension:.3,pointRadius:2},
+          ]},
+          options:{
+            responsive:true,maintainAspectRatio:false,
+            plugins:{legend:{labels:{color:'#8892a4',boxWidth:12}}},
+            scales:{
+              x:{ticks:{color:'#8892a4',maxTicksLimit:10},grid:{color:'#2d314930'}},
+              y:{ticks:{color:'#8892a4'},grid:{color:'#2d3149'}}
+            }
+          }
+        });
+        return ()=>{ if(inst.current) inst.current.destroy(); };
+      },[JSON.stringify(data)]);
+      return <div style={{height:220}}><canvas ref={ref}/></div>;
+    }
+
+    /* ── AuthScreen ──────────────────────────────────────────────────────── */
     function AuthScreen({ onAuth }) {
       const [mode,    setMode]    = useState('login');
       const [form,    setForm]    = useState({ username:'', password:'', confirm:'' });
@@ -198,16 +249,12 @@
       return (
         <div className="min-h-screen bg-[#0f1117] flex items-center justify-center p-4">
           <div className="w-full max-w-sm fade-in">
-            {/* Logo */}
             <div className="text-center mb-8">
               <div className="text-6xl mb-3">💰</div>
               <h1 className="text-3xl font-black text-white tracking-tight">MisFinanzas</h1>
               <p className="text-muted mt-2 text-sm">Gestión personal de ingresos y gastos</p>
             </div>
-
-            {/* Card */}
             <div className="bg-surface border border-border rounded-2xl p-7 shadow-2xl">
-              {/* Toggle */}
               <div className="flex gap-2 mb-6 bg-surface-2 p-1 rounded-xl">
                 {['login','register'].map(m=>(
                   <button key={m} onClick={()=>switchMode(m)}
@@ -218,7 +265,6 @@
                   </button>
                 ))}
               </div>
-
               <form onSubmit={handleSubmit} className="space-y-4">
                 <div>
                   <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Usuario</label>
@@ -226,14 +272,12 @@
                     placeholder="tu_nombre_de_usuario" autoFocus required
                     className="w-full bg-surface-2 border border-border rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] transition-colors" />
                 </div>
-
                 <div>
                   <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Contraseña</label>
                   <input type="password" value={form.password} onChange={e=>set('password',e.target.value)}
                     placeholder={mode==='register' ? 'Mínimo 6 caracteres' : '••••••••'} required
                     className="w-full bg-surface-2 border border-border rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] transition-colors" />
                 </div>
-
                 {mode==='register' && (
                   <div className="fade-in">
                     <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Confirmar contraseña</label>
@@ -242,13 +286,11 @@
                       className="w-full bg-surface-2 border border-border rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] transition-colors" />
                   </div>
                 )}
-
                 {error && (
                   <div className="fade-in bg-brand-red/10 border border-brand-red/30 text-brand-red text-sm px-4 py-3 rounded-xl flex items-start gap-2">
                     <span className="shrink-0 mt-0.5">⚠</span> {error}
                   </div>
                 )}
-
                 <button type="submit" disabled={loading}
                   className={`w-full py-3 rounded-xl font-bold text-sm transition-all mt-1 ${
                     loading ? 'bg-[#3d4266] text-muted cursor-not-allowed'
@@ -260,7 +302,6 @@
                   }
                 </button>
               </form>
-
               {mode==='login' && (
                 <p className="text-center text-xs text-muted mt-4">
                   ¿No tienes cuenta?{' '}
@@ -274,28 +315,41 @@
                 </p>
               )}
             </div>
-
-            <p className="text-center text-xs text-muted mt-6 opacity-50">
-              Tus datos son privados y solo tú puedes verlos.
-            </p>
+            <p className="text-center text-xs text-muted mt-6 opacity-50">Tus datos son privados y solo tú puedes verlos.</p>
           </div>
         </div>
       );
     }
 
-    /* ── Formulario de transacción ───────────────────────────────────────── */
-    function TransactionForm({ onClose, onSave, rates }) {
+    /* ── TransactionForm (create + edit) ────────────────────────────────── */
+    function TransactionForm({ onClose, onSave, rates, editData }) {
+      const isEdit = Boolean(editData);
       const now = new Date(); now.setMinutes(now.getMinutes()-now.getTimezoneOffset());
-      const [form, setForm] = useState({
-        type:'gasto', description:'', category:CATS_GASTO[0],
-        amount:'', currency:'VES', payment_method:PAY_METHODS[0],
-        exchange_rate_bcv:rates?.bcv||'', exchange_rate_binance:rates?.binance_p2p||'',
-        notes:'', date:now.toISOString().slice(0,16),
+      const [form, setForm] = useState(() => {
+        if (isEdit) {
+          const d = new Date(editData.date);
+          d.setMinutes(d.getMinutes()-d.getTimezoneOffset());
+          return {
+            type: editData.type, description: editData.description,
+            category: editData.category, amount: String(editData.amount),
+            currency: editData.currency, payment_method: editData.payment_method || PAY_METHODS[0],
+            exchange_rate_bcv: editData.exchange_rate_bcv || '',
+            exchange_rate_binance: editData.exchange_rate_binance || '',
+            notes: editData.notes || '', tags: editData.tags || '',
+            date: d.toISOString().slice(0,16),
+          };
+        }
+        return {
+          type:'gasto', description:'', category:CATS_GASTO[0],
+          amount:'', currency:'VES', payment_method:PAY_METHODS[0],
+          exchange_rate_bcv:rates?.bcv||'', exchange_rate_binance:rates?.binance_p2p||'',
+          notes:'', tags:'', date:now.toISOString().slice(0,16),
+        };
       });
       const [saving, setSaving] = useState(false);
       const set = (k,v) => setForm(p=>({...p,[k]:v}));
 
-      const handleType = t => { set('type',t); set('category', t==='ingreso'?CATS_INGRESO[0]:CATS_GASTO[0]); };
+      const handleType = t => { set('type',t); if(!isEdit) set('category', t==='ingreso'?CATS_INGRESO[0]:CATS_GASTO[0]); };
       const showBcv     = form.currency!=='USDT';
       const showBinance = form.currency!=='VES';
 
@@ -317,6 +371,7 @@
             exchange_rate_bcv:    form.exchange_rate_bcv    ? parseFloat(form.exchange_rate_bcv)    : null,
             exchange_rate_binance:form.exchange_rate_binance? parseFloat(form.exchange_rate_binance): null,
             date: new Date(form.date).toISOString(),
+            tags: form.tags.trim() || null,
           });
         } finally { setSaving(false); }
       };
@@ -328,7 +383,7 @@
           onClick={e=>e.target===e.currentTarget&&onClose()}>
           <div className="bg-surface border border-border rounded-2xl w-full max-w-lg shadow-2xl my-4 fade-in">
             <div className="flex items-center justify-between px-6 py-4 border-b border-border">
-              <h2 className="text-base font-bold text-white">Registrar movimiento</h2>
+              <h2 className="text-base font-bold text-white">{isEdit ? 'Editar movimiento' : 'Registrar movimiento'}</h2>
               <button onClick={onClose} className="text-muted hover:text-white transition-colors w-7 h-7 flex items-center justify-center rounded-lg hover:bg-surface-2">✕</button>
             </div>
             <form onSubmit={handleSubmit} className="p-6 space-y-4">
@@ -418,13 +473,18 @@
                     className="w-full bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169]" />
                 </div>
               </div>
+              <div>
+                <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Tags</label>
+                <input value={form.tags} onChange={e=>set('tags',e.target.value)} placeholder="vacaciones, trabajo, familia..."
+                  className="w-full bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-purple placeholder-[#4d5169]" />
+              </div>
               <button type="submit" disabled={saving}
                 className={`w-full py-3 rounded-xl font-bold text-sm transition-all ${
                   saving ? 'bg-[#3d4266] text-muted cursor-not-allowed'
                   : form.type==='ingreso' ? 'bg-brand-green hover:bg-[#00b386] text-[#0a1a12] active:scale-95'
                                           : 'bg-brand-blue hover:bg-[#3d7de0] text-white active:scale-95'
                 }`}>
-                {saving ? 'Guardando...' : `Registrar ${form.type==='ingreso'?'Ingreso':'Gasto'}`}
+                {saving ? 'Guardando...' : isEdit ? 'Guardar cambios' : `Registrar ${form.type==='ingreso'?'Ingreso':'Gasto'}`}
               </button>
             </form>
           </div>
@@ -432,7 +492,7 @@
       );
     }
 
-    /* ── Summary Card ────────────────────────────────────────────────────── */
+    /* ── SummaryCard ─────────────────────────────────────────────────────── */
     function SummaryCard({ label, value, sub, icon, colorKey }) {
       const cm = {
         blue:   { bg:'bg-brand-blue/10',   text:'text-brand-blue',   border:'border-brand-blue/30'   },
@@ -453,11 +513,11 @@
       );
     }
 
-    /* ── Dashboard ───────────────────────────────────────────────────────── */
-    function DashboardTab({ summary, flow, rates }) {
+    /* ── DashboardTab ────────────────────────────────────────────────────── */
+    function DashboardTab({ summary, flow, rates, rateHistory }) {
       if (!summary) return <div className="flex items-center justify-center h-64 text-muted text-sm">Cargando datos...</div>;
-      const saldoUSD = rates?.bcv        ? summary.saldo_ves/rates.bcv                        : null;
-      const usdtVES  = rates?.binance_p2p ? summary.usdt_balance*rates.binance_p2p            : null;
+      const saldoUSD = rates?.bcv        ? summary.saldo_ves/rates.bcv         : null;
+      const usdtVES  = rates?.binance_p2p ? summary.usdt_balance*rates.binance_p2p : null;
       const cards = [
         { label:'Saldo en Bolívares',   value:fmtVES(summary.saldo_ves),
           sub:`+${fmtVES(summary.total_ingresos_ves)} / -${fmtVES(summary.total_gastos_ves)}`, icon:'Bs', colorKey:'blue' },
@@ -468,11 +528,32 @@
         { label:'Gastos este mes',       value:fmtVES(summary.monthly_gastos),
           sub:`Ingresos mes: ${fmtVES(summary.monthly_ingresos)}`, icon:'↓', colorKey:'red' },
       ];
+      const alerts = summary.budget_alerts || [];
       return (
         <div className="space-y-6 fade-in">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             {cards.map(c=><SummaryCard key={c.label} {...c}/>)}
           </div>
+
+          {alerts.length > 0 && (
+            <div className="bg-surface border border-brand-red/30 rounded-2xl p-4">
+              <h3 className="text-sm font-semibold text-brand-red mb-3">⚠ Alertas de presupuesto este mes</h3>
+              <div className="space-y-2">
+                {alerts.map(a=>(
+                  <div key={a.category} className="flex items-center gap-3">
+                    <span className="text-xs text-white w-28 shrink-0 truncate">{a.category}</span>
+                    <div className="flex-1 bg-surface-2 rounded-full h-2 overflow-hidden">
+                      <div className={`h-full rounded-full transition-all ${a.pct>=100?'bg-brand-red':'bg-brand-yellow'}`}
+                        style={{width:`${Math.min(a.pct,100)}%`}}/>
+                    </div>
+                    <span className={`text-xs font-bold shrink-0 ${a.pct>=100?'text-brand-red':'text-brand-yellow'}`}>{a.pct}%</span>
+                    <span className="text-xs text-muted shrink-0">{fmtVES(a.spent_ves)} / {fmtVES(a.limit_ves)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="bg-surface border border-border rounded-2xl p-5">
               <h3 className="text-sm font-semibold text-white mb-4">Flujo mensual (últimos 6 meses)</h3>
@@ -485,28 +566,56 @@
                 : <div className="flex items-center justify-center h-48 text-muted text-sm">Sin gastos registrados</div>}
             </div>
           </div>
+
+          {rateHistory?.length > 1 && (
+            <div className="bg-surface border border-border rounded-2xl p-5">
+              <h3 className="text-sm font-semibold text-white mb-4">Historial de tasas (últimas lecturas)</h3>
+              <RateHistoryChart data={rateHistory}/>
+            </div>
+          )}
         </div>
       );
     }
 
-    /* ── Transacciones ───────────────────────────────────────────────────── */
-    function TransactionsTab({ transactions, rates, onAdd, onDelete }) {
+    /* ── TransactionsTab ─────────────────────────────────────────────────── */
+    function TransactionsTab({ transactions, rates, onAdd, onEdit, onDelete }) {
       const [showForm, setShowForm] = useState(false);
+      const [editTxn,  setEditTxn]  = useState(null);
       const [filter,   setFilter]   = useState({ type:'', category:'', search:'' });
       const allCats = [...new Set(transactions.map(t=>t.category))].sort();
       const setF = (k,v) => setFilter(p=>({...p,[k]:v}));
       const filtered = transactions.filter(t=>{
         if(filter.type     && t.type!==filter.type) return false;
         if(filter.category && t.category!==filter.category) return false;
-        if(filter.search   && !t.description.toLowerCase().includes(filter.search.toLowerCase())) return false;
+        if(filter.search   && !t.description.toLowerCase().includes(filter.search.toLowerCase())
+                           && !(t.tags||'').toLowerCase().includes(filter.search.toLowerCase())) return false;
         return true;
       });
       const handleSave = async data => { await onAdd(data); setShowForm(false); };
+      const handleEditSave = async data => { await onEdit(editTxn.id, data); setEditTxn(null); };
+
+      const downloadCSV = () => {
+        const rows = [
+          ['Fecha','Tipo','Categoría','Descripción','Monto','Moneda','Monto Bs','Método','Notas','Tags'],
+          ...transactions.map(t=>[
+            fmtDateTime(t.date), t.type, t.category, t.description,
+            t.amount, t.currency, t.amount_ves, t.payment_method||'', t.notes||'', t.tags||''
+          ])
+        ];
+        const csv = rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+        const blob = new Blob(['﻿'+csv],{type:'text/csv;charset=utf-8'});
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `misfinanzas_${new Date().toISOString().slice(0,10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      };
+
       return (
         <div className="space-y-4 fade-in">
           <div className="flex flex-wrap gap-3 items-center">
-            <input value={filter.search} onChange={e=>setF('search',e.target.value)} placeholder="🔍  Buscar..."
-              className="bg-surface border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] w-48"/>
+            <input value={filter.search} onChange={e=>setF('search',e.target.value)} placeholder="🔍  Buscar descripción o tag..."
+              className="bg-surface border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] w-52"/>
             <select value={filter.type} onChange={e=>setF('type',e.target.value)}
               className="bg-surface border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-blue">
               <option value="">Todos los tipos</option><option value="ingreso">Ingresos</option><option value="gasto">Gastos</option>
@@ -516,11 +625,17 @@
               <option value="">Todas las categorías</option>
               {allCats.map(c=><option key={c} value={c}>{c}</option>)}
             </select>
-            <span className="ml-auto text-xs text-muted">{filtered.length} registro{filtered.length!==1?'s':''}</span>
-            <button onClick={()=>setShowForm(true)}
-              className="bg-brand-blue hover:bg-[#3d7de0] text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors flex items-center gap-1.5 active:scale-95">
-              + Agregar
-            </button>
+            <span className="text-xs text-muted">{filtered.length} registro{filtered.length!==1?'s':''}</span>
+            <div className="ml-auto flex gap-2">
+              <button onClick={downloadCSV}
+                className="border border-border hover:border-brand-green text-muted hover:text-brand-green px-3 py-2 rounded-lg text-sm font-semibold transition-colors flex items-center gap-1.5">
+                ↓ CSV
+              </button>
+              <button onClick={()=>setShowForm(true)}
+                className="bg-brand-blue hover:bg-[#3d7de0] text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors flex items-center gap-1.5 active:scale-95">
+                + Agregar
+              </button>
+            </div>
           </div>
           <div className="bg-surface border border-border rounded-2xl overflow-hidden">
             {filtered.length===0 ? (
@@ -532,7 +647,7 @@
                 <table className="w-full">
                   <thead>
                     <tr className="border-b border-border">
-                      {['Fecha','Tipo','Categoría','Descripción','Monto original','En Bolívares','Método',''].map(h=>(
+                      {['Fecha','Tipo','Categoría','Descripción','Monto original','En Bolívares','Método','Tags',''].map(h=>(
                         <th key={h} className="px-4 py-3 text-left text-[11px] text-muted uppercase tracking-wider font-semibold whitespace-nowrap">{h}</th>
                       ))}
                     </tr>
@@ -558,9 +673,22 @@
                           {t.type==='ingreso'?'+':'-'}{fmtVES(t.amount_ves)}
                         </td>
                         <td className="px-4 py-3 text-xs text-muted whitespace-nowrap">{t.payment_method||'—'}</td>
+                        <td className="px-4 py-3 text-xs text-muted max-w-[100px]">
+                          {t.tags && (
+                            <div className="flex flex-wrap gap-1">
+                              {t.tags.split(',').map(tag=>(
+                                <span key={tag} className="bg-brand-purple/10 border border-brand-purple/20 text-brand-purple px-1.5 py-0.5 rounded text-[10px]">{tag.trim()}</span>
+                              ))}
+                            </div>
+                          )}
+                        </td>
                         <td className="px-4 py-3">
-                          <button onClick={()=>onDelete(t.id)}
-                            className="text-muted hover:text-brand-red transition-colors p-1.5 rounded-lg hover:bg-brand-red/10">✕</button>
+                          <div className="flex gap-1">
+                            <button onClick={()=>setEditTxn(t)}
+                              className="text-muted hover:text-brand-blue transition-colors p-1.5 rounded-lg hover:bg-brand-blue/10 text-xs">✎</button>
+                            <button onClick={()=>onDelete(t.id)}
+                              className="text-muted hover:text-brand-red transition-colors p-1.5 rounded-lg hover:bg-brand-red/10">✕</button>
+                          </div>
                         </td>
                       </tr>
                     ))}
@@ -570,18 +698,35 @@
             )}
           </div>
           {showForm && <TransactionForm onClose={()=>setShowForm(false)} onSave={handleSave} rates={rates}/>}
+          {editTxn  && <TransactionForm onClose={()=>setEditTxn(null)}  onSave={handleEditSave} rates={rates} editData={editTxn}/>}
         </div>
       );
     }
 
-    /* ── Ahorros ─────────────────────────────────────────────────────────── */
-    function SavingsTab({ summary, rates, transactions }) {
+    /* ── SavingsTab ──────────────────────────────────────────────────────── */
+    function SavingsTab({ summary, rates, transactions, goals, onGoalCreate, onGoalDelete }) {
+      const [showGoalForm, setShowGoalForm] = useState(false);
+      const [goalForm,     setGoalForm]     = useState({ name:'', target_usdt:'', notes:'' });
+      const [saving,       setSaving]       = useState(false);
+
       const usdt   = summary?.usdt_balance || 0;
       const vesVal = rates?.binance_p2p ? usdt*rates.binance_p2p : null;
       const usdVal = rates?.bcv && vesVal!=null ? vesVal/rates.bcv : null;
       const usdtTxns = transactions.filter(t=>t.currency==='USDT');
+
+      const handleGoalSubmit = async e => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+          await onGoalCreate({ name: goalForm.name, target_usdt: parseFloat(goalForm.target_usdt), notes: goalForm.notes || null });
+          setGoalForm({ name:'', target_usdt:'', notes:'' });
+          setShowGoalForm(false);
+        } finally { setSaving(false); }
+      };
+
       return (
         <div className="space-y-6 fade-in">
+          {/* Saldo USDT */}
           <div className="bg-gradient-to-br from-surface to-[#1e2235] border border-brand-yellow/30 rounded-2xl p-6 md:p-8">
             <div className="flex items-center gap-4 mb-6">
               <div className="w-14 h-14 bg-brand-yellow/15 rounded-2xl flex items-center justify-center text-2xl font-bold text-brand-yellow">₮</div>
@@ -603,6 +748,83 @@
               </div>
             </div>
           </div>
+
+          {/* Metas de ahorro */}
+          <div className="bg-surface border border-border rounded-2xl p-5">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-bold text-white">Metas de ahorro</h3>
+              <button onClick={()=>setShowGoalForm(v=>!v)}
+                className="bg-brand-purple/20 hover:bg-brand-purple/30 border border-brand-purple/30 text-brand-purple px-3 py-1.5 rounded-lg text-xs font-bold transition-all">
+                {showGoalForm ? '✕ Cancelar' : '+ Nueva meta'}
+              </button>
+            </div>
+
+            {showGoalForm && (
+              <form onSubmit={handleGoalSubmit} className="fade-in mb-5 bg-surface-2 rounded-xl p-4 border border-border space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-muted uppercase tracking-wider mb-1">Nombre</label>
+                    <input value={goalForm.name} onChange={e=>setGoalForm(p=>({...p,name:e.target.value}))} required
+                      placeholder="Ej: Fondo de emergencia"
+                      className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-purple placeholder-[#4d5169]" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-muted uppercase tracking-wider mb-1">Objetivo (USDT)</label>
+                    <input type="number" step="0.01" min="0" value={goalForm.target_usdt} onChange={e=>setGoalForm(p=>({...p,target_usdt:e.target.value}))} required
+                      placeholder="500"
+                      className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-purple placeholder-[#4d5169]" />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs text-muted uppercase tracking-wider mb-1">Notas (opcional)</label>
+                  <input value={goalForm.notes} onChange={e=>setGoalForm(p=>({...p,notes:e.target.value}))}
+                    placeholder="¿Para qué es esta meta?"
+                    className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-purple placeholder-[#4d5169]" />
+                </div>
+                <button type="submit" disabled={saving}
+                  className="bg-brand-purple hover:bg-[#9571f6] text-white px-4 py-2 rounded-lg text-sm font-bold transition-all disabled:opacity-50">
+                  {saving ? 'Guardando...' : 'Crear meta'}
+                </button>
+              </form>
+            )}
+
+            {goals.length===0 ? (
+              <div className="text-center text-muted text-sm py-6">Sin metas. Crea una para ver tu progreso hacia tus objetivos financieros.</div>
+            ) : (
+              <div className="space-y-4">
+                {goals.map(g=>{
+                  const pct = Math.min((usdt / g.target_usdt) * 100, 100);
+                  const remaining = Math.max(g.target_usdt - usdt, 0);
+                  return (
+                    <div key={g.id} className="bg-surface-2 rounded-xl p-4 border border-border">
+                      <div className="flex items-start justify-between mb-2">
+                        <div>
+                          <p className="text-sm font-semibold text-white">{g.name}</p>
+                          {g.notes && <p className="text-xs text-muted">{g.notes}</p>}
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0 ml-3">
+                          <span className={`text-xs font-bold ${pct>=100?'text-brand-green':'text-brand-yellow'}`}>{pct.toFixed(1)}%</span>
+                          <button onClick={()=>onGoalDelete(g.id)} className="text-muted hover:text-brand-red transition-colors p-1 rounded hover:bg-brand-red/10">✕</button>
+                        </div>
+                      </div>
+                      <div className="bg-surface rounded-full h-2 overflow-hidden mb-2">
+                        <div className={`h-full rounded-full transition-all duration-500 ${pct>=100?'bg-brand-green':'bg-brand-purple'}`}
+                          style={{width:`${pct}%`}}/>
+                      </div>
+                      <div className="flex justify-between text-xs text-muted">
+                        <span>{fmtUSDT(usdt)} actual</span>
+                        <span>Objetivo: {fmtUSDT(g.target_usdt)}</span>
+                      </div>
+                      {pct < 100 && <p className="text-xs text-muted mt-1">Faltan {fmtUSDT(remaining)}</p>}
+                      {pct >= 100 && <p className="text-xs text-brand-green mt-1 font-semibold">¡Meta alcanzada! 🎉</p>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Historial USDT */}
           <div className="bg-surface border border-border rounded-2xl p-5">
             <h3 className="text-sm font-bold text-white mb-4">Historial de movimientos en USDT</h3>
             {usdtTxns.length===0 ? (
@@ -633,7 +855,81 @@
       );
     }
 
-    /* ── Asistente IA ────────────────────────────────────────────────────── */
+    /* ── BudgetTab ───────────────────────────────────────────────────────── */
+    function BudgetTab({ budgets, budgetStatus, rates, onCreate, onDelete }) {
+      const [form, setForm] = useState({ category: CATS_GASTO[0], limit_ves: '' });
+      const [saving, setSaving] = useState(false);
+
+      const handleSubmit = async e => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+          await onCreate({ category: form.category, limit_ves: parseFloat(form.limit_ves) });
+          setForm(p=>({...p, limit_ves:''}));
+        } finally { setSaving(false); }
+      };
+
+      return (
+        <div className="space-y-6 fade-in">
+          {/* Crear presupuesto */}
+          <div className="bg-surface border border-border rounded-2xl p-5">
+            <h3 className="text-sm font-bold text-white mb-4">Nuevo presupuesto mensual</h3>
+            <form onSubmit={handleSubmit} className="flex flex-wrap gap-3 items-end">
+              <div>
+                <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Categoría</label>
+                <select value={form.category} onChange={e=>setForm(p=>({...p,category:e.target.value}))}
+                  className="bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue">
+                  {CATS_GASTO.map(c=><option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-muted uppercase tracking-wider mb-1.5">Límite mensual (Bs)</label>
+                <input type="number" step="1" min="1" value={form.limit_ves} onChange={e=>setForm(p=>({...p,limit_ves:e.target.value}))} required
+                  placeholder="50000"
+                  className="bg-surface-2 border border-border rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-brand-blue placeholder-[#4d5169] w-40" />
+              </div>
+              <button type="submit" disabled={saving}
+                className="bg-brand-blue hover:bg-[#3d7de0] text-white px-4 py-2.5 rounded-lg text-sm font-bold transition-all disabled:opacity-50">
+                {saving ? 'Guardando...' : '+ Agregar'}
+              </button>
+            </form>
+          </div>
+
+          {/* Estado este mes */}
+          {budgetStatus.length > 0 && (
+            <div className="bg-surface border border-border rounded-2xl p-5">
+              <h3 className="text-sm font-bold text-white mb-4">Estado este mes</h3>
+              <div className="space-y-4">
+                {budgetStatus.map(b=>(
+                  <div key={b.id}>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-sm text-white font-medium">{b.category}</span>
+                      <div className="flex items-center gap-3">
+                        <span className={`text-xs font-bold ${b.triggered?'text-brand-red':b.pct>=80?'text-brand-yellow':'text-brand-green'}`}>{b.pct}%</span>
+                        <span className="text-xs text-muted">{fmtVES(b.spent_ves)} / {fmtVES(b.limit_ves)}</span>
+                        <button onClick={()=>onDelete(b.id)} className="text-muted hover:text-brand-red transition-colors p-1 rounded hover:bg-brand-red/10 text-xs">✕</button>
+                      </div>
+                    </div>
+                    <div className="bg-surface-2 rounded-full h-2 overflow-hidden">
+                      <div className={`h-full rounded-full transition-all duration-500 ${b.triggered?'bg-brand-red':b.pct>=80?'bg-brand-yellow':'bg-brand-green'}`}
+                        style={{width:`${Math.min(b.pct,100)}%`}}/>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {budgets.length===0 && (
+            <div className="text-center text-muted text-sm py-12">
+              Sin presupuestos configurados. Agrega uno para recibir alertas cuando superes tu límite mensual.
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ── AITab ───────────────────────────────────────────────────────────── */
     const SUGGESTED = [
       '¿Cuánto gasté este mes?',
       '¿Cómo están mis ahorros en USDT?',
@@ -694,14 +990,12 @@
 
       if(configured===null) return <div className="flex items-center justify-center h-64 text-muted text-sm">Cargando...</div>;
 
-      /* ── Setup screen ── */
       if(!configured) return (
         <div className="max-w-lg mx-auto fade-in">
           <div className="bg-surface border border-border rounded-2xl p-8 text-center">
             <div className="text-5xl mb-4">🤖</div>
             <h2 className="text-xl font-bold text-white mb-2">Configura el Asistente IA</h2>
             <p className="text-muted text-sm mb-6">Usa <span className="text-brand-blue font-semibold">Google Gemini</span> (gratis) para analizar tus finanzas con inteligencia artificial.</p>
-
             <div className="bg-surface-2 border border-border rounded-xl p-4 text-left mb-6 space-y-2">
               <p className="text-xs font-bold text-white uppercase tracking-wider mb-3">Cómo obtener tu API key gratis:</p>
               {['Ve a aistudio.google.com', 'Inicia sesión con tu cuenta Google', 'Clic en "Get API Key" → "Create API key"', 'Copia la key y pégala aquí abajo'].map((s,i)=>(
@@ -711,7 +1005,6 @@
                 </div>
               ))}
             </div>
-
             <form onSubmit={saveKey} className="space-y-3">
               <input value={apiKeyInput} onChange={e=>{setApiKeyInput(e.target.value);setKeyError('');}}
                 placeholder="AIza..." required
@@ -729,10 +1022,8 @@
         </div>
       );
 
-      /* ── Chat screen ── */
       return (
         <div className="flex flex-col fade-in" style={{height:'calc(100vh - 130px)'}}>
-          {/* Messages */}
           <div className="flex-1 overflow-y-auto space-y-4 pr-1 pb-2">
             {messages.length===0 && (
               <div className="text-center py-8">
@@ -749,7 +1040,6 @@
                 </div>
               </div>
             )}
-
             {messages.map((m,i)=>(
               <div key={i} className={`flex ${m.role==='user'?'justify-end':'justify-start'}`}>
                 <div className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm ${
@@ -762,7 +1052,6 @@
                 </div>
               </div>
             ))}
-
             {loading && (
               <div className="flex justify-start">
                 <div className="bg-surface border border-border rounded-2xl rounded-bl-md px-4 py-3">
@@ -777,8 +1066,6 @@
             )}
             <div ref={bottomRef}/>
           </div>
-
-          {/* Input */}
           <div className="pt-3 border-t border-border">
             <div className="flex gap-2">
               <textarea ref={inputRef} value={input} onChange={e=>setInput(e.target.value)} onKeyDown={handleKey}
@@ -793,19 +1080,20 @@
                 ➤
               </button>
             </div>
-            <p className="text-xs text-muted mt-1.5 text-center opacity-50">Gemini 1.5 Flash · Tus datos financieros se envían como contexto</p>
+            <p className="text-xs text-muted mt-1.5 text-center opacity-50">Gemini 2.0 Flash · Tus datos financieros se envían como contexto</p>
           </div>
         </div>
       );
     }
 
-    /* ── Header (con usuario + logout) ──────────────────────────────────── */
+    /* ── Header ──────────────────────────────────────────────────────────── */
     function Header({ rates, onRefresh, loadingRates, tab, setTab, username, onLogout }) {
       const tabs = [
         {id:'dashboard',    label:'Dashboard'},
         {id:'transactions', label:'Movimientos'},
-        {id:'savings',      label:'Ahorros USDT'},
-        {id:'ai',           label:'✨ Asistente IA'},
+        {id:'savings',      label:'Ahorros'},
+        {id:'budgets',      label:'Presupuestos'},
+        {id:'ai',           label:'✨ IA'},
       ];
       return (
         <header className="bg-surface border-b border-border sticky top-0 z-30">
@@ -814,8 +1102,6 @@
               <span className="text-lg">💰</span>
               <span className="text-white font-black text-base tracking-tight">MisFinanzas</span>
             </div>
-
-            {/* Tasas */}
             <div className="flex items-center gap-2">
               <div className="flex items-center gap-1.5 bg-surface-2 border border-border rounded-lg px-3 py-1.5">
                 <span className="text-[10px] text-muted uppercase tracking-wider font-bold">BCV</span>
@@ -832,8 +1118,6 @@
                 ↻
               </button>
             </div>
-
-            {/* Nav */}
             <nav className="flex gap-1 ml-auto">
               {tabs.map(t=>(
                 <button key={t.id} onClick={()=>setTab(t.id)}
@@ -842,15 +1126,12 @@
                   }`}>{t.label}</button>
               ))}
             </nav>
-
-            {/* Usuario */}
             <div className="flex items-center gap-2 pl-2 border-l border-border ml-1">
               <div className="w-7 h-7 bg-brand-blue/20 rounded-full flex items-center justify-center text-xs font-bold text-brand-blue uppercase">
                 {username?.[0] || '?'}
               </div>
               <span className="text-sm text-white font-medium hidden sm:block">{username}</span>
-              <button onClick={onLogout}
-                title="Cerrar sesión"
+              <button onClick={onLogout} title="Cerrar sesión"
                 className="text-muted hover:text-brand-red transition-colors text-xs px-2 py-1 rounded-lg hover:bg-brand-red/10 ml-1">
                 Salir
               </button>
@@ -860,16 +1141,20 @@
       );
     }
 
-    /* ── App principal ───────────────────────────────────────────────────── */
+    /* ── App ─────────────────────────────────────────────────────────────── */
     function App() {
-      const [token,        setToken]        = useState(()=>localStorage.getItem(LS_TOKEN));
-      const [username,     setUsername]     = useState(()=>localStorage.getItem(LS_USER));
-      const [tab,          setTab]          = useState('dashboard');
-      const [rates,        setRates]        = useState(null);
-      const [transactions, setTransactions] = useState([]);
-      const [summary,      setSummary]      = useState(null);
-      const [flow,         setFlow]         = useState(null);
-      const [loadingRates, setLoadingRates] = useState(false);
+      const [token,         setToken]         = useState(()=>localStorage.getItem(LS_TOKEN));
+      const [username,      setUsername]      = useState(()=>localStorage.getItem(LS_USER));
+      const [tab,           setTab]           = useState('dashboard');
+      const [rates,         setRates]         = useState(null);
+      const [rateHistory,   setRateHistory]   = useState([]);
+      const [transactions,  setTransactions]  = useState([]);
+      const [summary,       setSummary]       = useState(null);
+      const [flow,          setFlow]          = useState(null);
+      const [goals,         setGoals]         = useState([]);
+      const [budgets,       setBudgets]       = useState([]);
+      const [budgetStatus,  setBudgetStatus]  = useState([]);
+      const [loadingRates,  setLoadingRates]  = useState(false);
       const { show:toast, ToastContainer } = useToast();
 
       const handleLogout = useCallback(() => {
@@ -877,6 +1162,7 @@
         localStorage.removeItem(LS_USER);
         setToken(null); setUsername(null);
         setTransactions([]); setSummary(null); setFlow(null);
+        setGoals([]); setBudgets([]); setBudgetStatus([]);
       }, []);
 
       const api = useCallback(()=>{
@@ -888,8 +1174,11 @@
         const a = api(); if(!a) return;
         await Promise.all([
           a.getTransactions().then(setTransactions).catch(()=>{}),
-          a.getSummary().then(setSummary).catch(()=>{}),
+          a.getSummary().then(d=>{ setSummary(d); setBudgetStatus(d.budget_alerts||[]); }).catch(()=>{}),
           a.getFlow().then(setFlow).catch(()=>{}),
+          a.getGoals().then(setGoals).catch(()=>{}),
+          a.getBudgets().then(setBudgets).catch(()=>{}),
+          a.checkBudgets().then(setBudgetStatus).catch(()=>{}),
         ]);
       }, [api]);
 
@@ -899,6 +1188,7 @@
         try {
           const data = await a.getRates();
           setRates(data);
+          a.getRatesHistory().then(setRateHistory).catch(()=>{});
           if(!silent) toast('Tasas actualizadas','success');
         } catch { if(!silent) toast('Error al obtener tasas','error'); }
         finally { setLoadingRates(false); }
@@ -916,6 +1206,12 @@
         catch(e) { toast('Error al guardar','error'); throw e; }
       };
 
+      const handleEdit = async (id, data) => {
+        const a = api(); if(!a) return;
+        try { await a.edit(id, data); await loadData(); toast('Movimiento actualizado ✓','success'); }
+        catch(e) { toast('Error al editar','error'); throw e; }
+      };
+
       const handleDelete = async id => {
         if(!confirm('¿Eliminar este movimiento?')) return;
         const a = api(); if(!a) return;
@@ -923,7 +1219,40 @@
         catch { toast('Error al eliminar','error'); }
       };
 
-      // Verificar token al cargar + cargar datos
+      const handleGoalCreate = async data => {
+        const a = api(); if(!a) return;
+        try { await a.createGoal(data); const gs = await a.getGoals(); setGoals(gs); toast('Meta creada ✓','success'); }
+        catch { toast('Error al crear meta','error'); }
+      };
+
+      const handleGoalDelete = async id => {
+        if(!confirm('¿Eliminar esta meta?')) return;
+        const a = api(); if(!a) return;
+        try { await a.deleteGoal(id); const gs = await a.getGoals(); setGoals(gs); toast('Meta eliminada','success'); }
+        catch { toast('Error al eliminar meta','error'); }
+      };
+
+      const handleBudgetCreate = async data => {
+        const a = api(); if(!a) return;
+        try {
+          await a.createBudget(data);
+          const [bs, cs] = await Promise.all([a.getBudgets(), a.checkBudgets()]);
+          setBudgets(bs); setBudgetStatus(cs);
+          toast('Presupuesto guardado ✓','success');
+        } catch { toast('Error al guardar presupuesto','error'); }
+      };
+
+      const handleBudgetDelete = async id => {
+        if(!confirm('¿Eliminar este presupuesto?')) return;
+        const a = api(); if(!a) return;
+        try {
+          await a.deleteBudget(id);
+          const [bs, cs] = await Promise.all([a.getBudgets(), a.checkBudgets()]);
+          setBudgets(bs); setBudgetStatus(cs);
+          toast('Presupuesto eliminado','success');
+        } catch { toast('Error al eliminar','error'); }
+      };
+
       useEffect(() => {
         if(!token) return;
         const a = makeApi(token, handleLogout);
@@ -945,9 +1274,10 @@
             username={username} onLogout={handleLogout}
           />
           <main className="max-w-7xl mx-auto px-4 py-6">
-            {tab==='dashboard'    && <DashboardTab    summary={summary} flow={flow} rates={rates}/>}
-            {tab==='transactions' && <TransactionsTab transactions={transactions} rates={rates} onAdd={handleAdd} onDelete={handleDelete}/>}
-            {tab==='savings'      && <SavingsTab      summary={summary} rates={rates} transactions={transactions}/>}
+            {tab==='dashboard'    && <DashboardTab    summary={summary} flow={flow} rates={rates} rateHistory={rateHistory}/>}
+            {tab==='transactions' && <TransactionsTab transactions={transactions} rates={rates} onAdd={handleAdd} onEdit={handleEdit} onDelete={handleDelete}/>}
+            {tab==='savings'      && <SavingsTab      summary={summary} rates={rates} transactions={transactions} goals={goals} onGoalCreate={handleGoalCreate} onGoalDelete={handleGoalDelete}/>}
+            {tab==='budgets'      && <BudgetTab       budgets={budgets} budgetStatus={budgetStatus} rates={rates} onCreate={handleBudgetCreate} onDelete={handleBudgetDelete}/>}
             {tab==='ai'           && <AITab           token={token}/>}
           </main>
           <ToastContainer/>
