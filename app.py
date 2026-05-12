@@ -1,21 +1,28 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, text, func
 from sqlalchemy.orm import sessionmaker, Session, DeclarativeBase
 import bcrypt as _bcrypt
 from jose import JWTError, jwt
 from google import genai
 from google.genai import types as gtypes
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from typing import Literal
 import httpx
 import asyncio
 import secrets
 import os
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 from typing import Optional, List
+
+# ── Rate Limiter ──────────────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
 
 # ── Clave secreta persistente ─────────────────────────────────────────────────
 _KEY_FILE = ".secret_key"
@@ -27,7 +34,7 @@ else:
     with open(_KEY_FILE, "w") as f:
         f.write(SECRET_KEY)
 
-ALGORITHM = "HS256"
+ALGORITHM        = "HS256"
 TOKEN_EXPIRE_DAYS = 30
 
 # ── Gemini API Key (cargado desde .env) ───────────────────────────────────────
@@ -67,11 +74,21 @@ def _get_genai_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
 # ── Base de datos ─────────────────────────────────────────────────────────────
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "mysql+pymysql://root:@localhost/misfinanzas"
+# ── Detecta automáticamente SQLite (local) o PostgreSQL (Render/Supabase/Neon) ────
+_RAW_DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./finanzas.db")
+
+# Render/Heroku/Neon entregan "postgres://..." pero SQLAlchemy 2.x requiere "postgresql://"
+if _RAW_DB_URL.startswith("postgres://"):
+    _RAW_DB_URL = _RAW_DB_URL.replace("postgres://", "postgresql://", 1)
+
+DATABASE_URL = _RAW_DB_URL
+_is_sqlite   = DATABASE_URL.startswith("sqlite")
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args={"check_same_thread": False} if _is_sqlite else {},
 )
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -80,7 +97,7 @@ class Base(DeclarativeBase):
 
 
 class User(Base):
-    __tablename__ = "users"
+    __tablename__   = "users"
     id              = Column(Integer, primary_key=True, index=True)
     username        = Column(String(150), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
@@ -88,7 +105,7 @@ class User(Base):
 
 
 class Transaction(Base):
-    __tablename__ = "transactions"
+    __tablename__        = "transactions"
     id                   = Column(Integer, primary_key=True, index=True)
     user_id              = Column(Integer, nullable=True)   # FK a users.id
     date                 = Column(DateTime, default=datetime.now)
@@ -108,13 +125,16 @@ class Transaction(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ── Migración: agregar user_id si no existe ───────────────────────────────────
-with engine.connect() as _conn:
-    try:
-        _conn.execute(text("ALTER TABLE transactions ADD COLUMN user_id INT"))
-        _conn.commit()
-    except Exception:
-        pass  # columna ya existe
+# ── Migración: agregar user_id si no existe (solo SQLite) ────────────────────
+from sqlalchemy.exc import OperationalError
+if _is_sqlite:
+    with engine.connect() as _conn:
+        try:
+            _conn.execute(text("ALTER TABLE transactions ADD COLUMN user_id INTEGER"))
+            _conn.commit()
+        except OperationalError as e:
+            if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
+                raise
 
 
 def get_db():
@@ -137,13 +157,14 @@ def hash_password(password: str) -> str:
     return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
 
 
+# CORREGIDO: datetime.utcnow() -> datetime.now(timezone.utc)
 def create_token(username: str) -> str:
-    expire = datetime.utcnow() + timedelta(days=TOKEN_EXPIRE_DAYS)
+    expire = datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRE_DAYS)
     return jwt.encode({"sub": username, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
 
 
 async def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    token: str    = Depends(oauth2_scheme),
     db:    Session = Depends(get_db),
 ) -> User:
     try:
@@ -216,43 +237,62 @@ class LoginRequest(BaseModel):
 
 
 class TransactionCreate(BaseModel):
-    description:          str
-    category:             str
-    type:                 str
-    amount:               float
-    currency:             str = "VES"
-    payment_method:       Optional[str]   = None
-    exchange_rate_bcv:    Optional[float] = None
-    exchange_rate_binance:Optional[float] = None
-    notes:                Optional[str]   = None
-    date:                 Optional[datetime] = None
+    description:           str
+    category:              str
+    # CORREGIDO: Literal valida que solo sean "ingreso" o "gasto"
+    type:                  Literal["ingreso", "gasto"]
+    amount:                float
+    currency:              str = "VES"
+    payment_method:        Optional[str]      = None
+    exchange_rate_bcv:     Optional[float]    = None
+    exchange_rate_binance: Optional[float]    = None
+    notes:                 Optional[str]      = None
+    date:                  Optional[datetime] = None
+
+
+# NUEVO: Schema para editar transacciones (PUT)
+class TransactionUpdate(BaseModel):
+    description:           Optional[str]      = None
+    category:              Optional[str]      = None
+    type:                  Optional[Literal["ingreso", "gasto"]] = None
+    amount:                Optional[float]    = None
+    currency:              Optional[str]      = None
+    payment_method:        Optional[str]      = None
+    exchange_rate_bcv:     Optional[float]    = None
+    exchange_rate_binance: Optional[float]    = None
+    notes:                 Optional[str]      = None
+    date:                  Optional[datetime] = None
 
 
 class TransactionOut(BaseModel):
-    id:                   int
-    date:                 datetime
-    description:          str
-    category:             str
-    type:                 str
-    amount:               float
-    currency:             str
-    payment_method:       Optional[str]
-    exchange_rate_bcv:    Optional[float]
-    exchange_rate_binance:Optional[float]
-    amount_ves:           float
-    amount_usd:           Optional[float]
-    amount_usdt:          Optional[float]
-    notes:                Optional[str]
+    id:                    int
+    date:                  datetime
+    description:           str
+    category:              str
+    type:                  str
+    amount:                float
+    currency:              str
+    payment_method:        Optional[str]
+    exchange_rate_bcv:     Optional[float]
+    exchange_rate_binance: Optional[float]
+    amount_ves:            float
+    amount_usd:            Optional[float]
+    amount_usdt:           Optional[float]
+    notes:                 Optional[str]
     model_config = {"from_attributes": True}
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="MisFinanzas")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 @app.post("/api/auth/register", status_code=201)
-def register(body: RegisterRequest, db: Session = Depends(get_db)):
+# CORREGIDO: rate limit — máx 5 registros por minuto por IP
+@limiter.limit("5/minute")
+def register(request: Request, body: RegisterRequest, db: Session = Depends(get_db)):
     username = body.username.strip().lower()
     if len(username) < 3:
         raise HTTPException(400, "El usuario debe tener mínimo 3 caracteres")
@@ -266,20 +306,22 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     db.refresh(user)
     return {
         "access_token": create_token(user.username),
-        "token_type": "bearer",
-        "username": user.username,
+        "token_type":   "bearer",
+        "username":     user.username,
     }
 
 
 @app.post("/api/auth/login")
-def login(body: LoginRequest, db: Session = Depends(get_db)):
+# CORREGIDO: rate limit — máx 10 intentos por minuto por IP (anti fuerza bruta)
+@limiter.limit("10/minute")
+def login(request: Request, body: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == body.username.strip().lower()).first()
     if not user or not verify_password(body.password, user.hashed_password):
         raise HTTPException(401, "Usuario o contraseña incorrectos")
     return {
         "access_token": create_token(user.username),
-        "token_type": "bearer",
-        "username": user.username,
+        "token_type":   "bearer",
+        "username":     user.username,
     }
 
 
@@ -367,6 +409,49 @@ def create_transaction(
     return t
 
 
+# NUEVO: endpoint PUT para editar transacciones
+@app.put("/api/transactions/{tid}", response_model=TransactionOut)
+def update_transaction(
+    tid:          int,
+    body:         TransactionUpdate,
+    db:           Session = Depends(get_db),
+    current_user: User    = Depends(get_current_user),
+):
+    t = (
+        db.query(Transaction)
+        .filter(Transaction.id == tid, Transaction.user_id == current_user.id)
+        .first()
+    )
+    if not t:
+        raise HTTPException(404, "Movimiento no encontrado")
+
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(t, field, value)
+
+    # Recalcular montos si cambiaron campos relevantes
+    currency = t.currency
+    amount   = t.amount
+    bcv      = t.exchange_rate_bcv
+    binance  = t.exchange_rate_binance
+
+    if currency == "USD" and bcv:
+        t.amount_ves  = amount * bcv
+        t.amount_usd  = amount
+        t.amount_usdt = t.amount_ves / binance if binance else None
+    elif currency == "USDT" and binance:
+        t.amount_ves  = amount * binance
+        t.amount_usdt = amount
+        t.amount_usd  = t.amount_ves / bcv if bcv else None
+    else:
+        t.amount_ves  = amount
+        t.amount_usd  = amount / bcv if bcv else None
+        t.amount_usdt = amount / binance if binance else None
+
+    db.commit()
+    db.refresh(t)
+    return t
+
+
 @app.delete("/api/transactions/{tid}")
 def delete_transaction(
     tid:          int,
@@ -385,64 +470,88 @@ def delete_transaction(
     return {"ok": True}
 
 
+# CORREGIDO: get_summary usa func.sum() en SQL, no Python en memoria
 @app.get("/api/summary")
 def get_summary(
     db:           Session = Depends(get_db),
     current_user: User    = Depends(get_current_user),
 ):
-    rows = db.query(Transaction).filter(Transaction.user_id == current_user.id).all()
+    uid = current_user.id
+    now = datetime.now()
 
-    total_ingresos = sum(r.amount_ves for r in rows if r.type == "ingreso")
-    total_gastos   = sum(r.amount_ves for r in rows if r.type == "gasto")
-    usdt_ingresos  = sum(r.amount for r in rows if r.type == "ingreso" and r.currency == "USDT")
-    usdt_gastos    = sum(r.amount for r in rows if r.type == "gasto"   and r.currency == "USDT")
+    def q_sum(type_: str, col=Transaction.amount_ves):
+        return db.query(func.coalesce(func.sum(col), 0.0)) \
+                 .filter(Transaction.user_id == uid, Transaction.type == type_) \
+                 .scalar()
 
-    now     = datetime.now()
-    monthly = [r for r in rows if r.date.month == now.month and r.date.year == now.year]
+    total_ingresos = q_sum("ingreso")
+    total_gastos   = q_sum("gasto")
 
-    categories: dict = {}
-    for r in rows:
-        if r.type == "gasto":
-            categories[r.category] = categories.get(r.category, 0) + r.amount_ves
+    usdt_ingresos = db.query(func.coalesce(func.sum(Transaction.amount), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "ingreso", Transaction.currency == "USDT").scalar()
+    usdt_gastos   = db.query(func.coalesce(func.sum(Transaction.amount), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "gasto",   Transaction.currency == "USDT").scalar()
+
+    monthly_ingresos = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "ingreso",
+                func.strftime("%Y-%m", Transaction.date) == now.strftime("%Y-%m")).scalar()
+    monthly_gastos   = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "gasto",
+                func.strftime("%Y-%m", Transaction.date) == now.strftime("%Y-%m")).scalar()
+
+    # Categorías: solo gastos, agrupados en SQL
+    cat_rows = db.query(Transaction.category, func.sum(Transaction.amount_ves)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "gasto") \
+        .group_by(Transaction.category).all()
+    categories = {row[0]: row[1] for row in cat_rows}
 
     return {
         "total_ingresos_ves": total_ingresos,
         "total_gastos_ves":   total_gastos,
         "saldo_ves":          total_ingresos - total_gastos,
         "usdt_balance":       usdt_ingresos - usdt_gastos,
-        "monthly_ingresos":   sum(r.amount_ves for r in monthly if r.type == "ingreso"),
-        "monthly_gastos":     sum(r.amount_ves for r in monthly if r.type == "gasto"),
+        "monthly_ingresos":   monthly_ingresos,
+        "monthly_gastos":     monthly_gastos,
         "categories":         categories,
     }
 
 
+# CORREGIDO: get_monthly_flow también usa SQL, no Python en memoria
 @app.get("/api/monthly-flow")
 def get_monthly_flow(
     db:           Session = Depends(get_db),
     current_user: User    = Depends(get_current_user),
 ):
-    rows    = db.query(Transaction).filter(Transaction.user_id == current_user.id).all()
+    uid = current_user.id
+    rows = db.query(
+        func.strftime("%Y-%m", Transaction.date).label("month"),
+        Transaction.type,
+        func.sum(Transaction.amount_ves).label("total"),
+    ).filter(Transaction.user_id == uid) \
+     .group_by("month", Transaction.type) \
+     .order_by("month") \
+     .all()
+
     monthly: dict = {}
-    for r in rows:
-        key = f"{r.date.year}-{r.date.month:02d}"
-        if key not in monthly:
-            monthly[key] = {"ingresos": 0, "gastos": 0}
-        if r.type == "ingreso":
-            monthly[key]["ingresos"] += r.amount_ves
+    for month, type_, total in rows:
+        if month not in monthly:
+            monthly[month] = {"ingresos": 0.0, "gastos": 0.0}
+        if type_ == "ingreso":
+            monthly[month]["ingresos"] = round(total, 2)
         else:
-            monthly[key]["gastos"]   += r.amount_ves
+            monthly[month]["gastos"]   = round(total, 2)
 
     sorted_months = sorted(monthly.items())[-6:]
     return {
         "labels":   [m[0] for m in sorted_months],
-        "ingresos": [round(m[1]["ingresos"], 2) for m in sorted_months],
-        "gastos":   [round(m[1]["gastos"],   2) for m in sorted_months],
+        "ingresos": [m[1]["ingresos"] for m in sorted_months],
+        "gastos":   [m[1]["gastos"]   for m in sorted_months],
     }
 
 
 # ── Asistente IA (Gemini) ─────────────────────────────────────────────────────
 class ChatMessage(BaseModel):
-    role: str     # "user" | "assistant"
+    role:    str   # "user" | "assistant"
     content: str
 
 
@@ -454,32 +563,27 @@ class GeminiKeyRequest(BaseModel):
     api_key: str
 
 
-def _build_system_prompt(username: str, rows: list, rates: dict) -> str:
-    total_ingresos = sum(r.amount_ves for r in rows if r.type == "ingreso")
-    total_gastos   = sum(r.amount_ves for r in rows if r.type == "gasto")
-    saldo          = total_ingresos - total_gastos
-    usdt_balance   = sum(r.amount for r in rows if r.type == "ingreso" and r.currency == "USDT") \
-                   - sum(r.amount for r in rows if r.type == "gasto"   and r.currency == "USDT")
+# CORREGIDO: _build_system_prompt recibe datos pre-calculados, no filas brutas
+def _build_system_prompt(username: str, summary: dict, last_txns: list, rates: dict) -> str:
+    saldo      = summary["saldo_ves"]
+    bcv_rate   = rates.get("bcv")
+    saldo_usd  = f"${saldo/bcv_rate:.2f}" if bcv_rate else "N/A"
+    usdt_bal   = summary["usdt_balance"]
+    binance_r  = rates.get("binance_p2p")
+    usdt_en_bs = f"Bs {usdt_bal*binance_r:,.2f}" if binance_r else "N/A"
 
     now = datetime.now()
-    monthly = [r for r in rows if r.date.month == now.month and r.date.year == now.year]
-    mes_ingresos = sum(r.amount_ves for r in monthly if r.type == "ingreso")
-    mes_gastos   = sum(r.amount_ves for r in monthly if r.type == "gasto")
 
-    cats: dict = {}
-    for r in rows:
-        if r.type == "gasto":
-            cats[r.category] = cats.get(r.category, 0) + r.amount_ves
-    cats_str = "\n".join(f"  • {k}: Bs {v:,.2f}" for k, v in sorted(cats.items(), key=lambda x: -x[1])[:8]) or "  Sin datos"
+    cats_str = "\n".join(
+        f"  • {k}: Bs {v:,.2f}"
+        for k, v in sorted(summary["categories"].items(), key=lambda x: -x[1])[:8]
+    ) or "  Sin datos"
 
-    last_txns = rows[:10]
-    txns_str  = "\n".join(
-        f"  {'↑' if t.type=='ingreso' else '↓'} {t.date.strftime('%d/%m')} | {t.category} | {t.description} | Bs {t.amount_ves:,.2f}"
+    # CORREGIDO: variable 'history' eliminada (era código muerto); se usa 'contents' directamente
+    txns_str = "\n".join(
+        f"  {'↑' if t['type']=='ingreso' else '↓'} {t['date']} | {t['category']} | {t['description']} | Bs {t['amount_ves']:,.2f}"
         for t in last_txns
     ) or "  Sin transacciones"
-
-    saldo_usd  = f"${saldo/rates['bcv']:.2f}" if rates.get("bcv") else "N/A"
-    usdt_en_bs = f"Bs {usdt_balance*rates['binance_p2p']:,.2f}" if rates.get("binance_p2p") else "N/A"
 
     return f"""Eres un asistente financiero personal inteligente y amigable, especializado en la economía venezolana.
 Ayudas al usuario "{username}" a entender y mejorar sus finanzas personales en bolívares (VES), dólares (USD) y USDT.
@@ -488,18 +592,18 @@ Ayudas al usuario "{username}" a entender y mejorar sus finanzas personales en b
 
 💰 RESUMEN GENERAL:
   • Saldo total: Bs {saldo:,.2f} ({saldo_usd} al BCV)
-  • Total ingresos históricos: Bs {total_ingresos:,.2f}
-  • Total gastos históricos: Bs {total_gastos:,.2f}
-  • Saldo USDT en Binance: {usdt_balance:.4f} USDT ({usdt_en_bs})
+  • Total ingresos históricos: Bs {summary['total_ingresos_ves']:,.2f}
+  • Total gastos históricos: Bs {summary['total_gastos_ves']:,.2f}
+  • Saldo USDT en Binance: {usdt_bal:.4f} USDT ({usdt_en_bs})
 
 📅 ESTE MES ({now.strftime('%B %Y')}):
-  • Ingresos: Bs {mes_ingresos:,.2f}
-  • Gastos: Bs {mes_gastos:,.2f}
-  • Balance del mes: Bs {mes_ingresos - mes_gastos:,.2f}
+  • Ingresos: Bs {summary['monthly_ingresos']:,.2f}
+  • Gastos: Bs {summary['monthly_gastos']:,.2f}
+  • Balance del mes: Bs {summary['monthly_ingresos'] - summary['monthly_gastos']:,.2f}
 
 💱 TASAS DE CAMBIO ACTUALES:
-  • Dólar BCV oficial: Bs {rates.get('bcv') or 'No disponible'}
-  • USDT Binance P2P: Bs {rates.get('binance_p2p') or 'No disponible'}
+  • Dólar BCV oficial: Bs {bcv_rate or 'No disponible'}
+  • USDT Binance P2P: Bs {binance_r or 'No disponible'}
 
 🗂️ GASTOS POR CATEGORÍA (acumulado):
 {cats_str}
@@ -539,27 +643,55 @@ async def ai_chat(
     if not body.messages:
         raise HTTPException(400, "Sin mensajes")
 
-    # Construir contexto financiero
-    rows = db.query(Transaction).filter(Transaction.user_id == current_user.id).all()
+    # CORREGIDO: obtener datos financieros via SQL (no cargar todas las filas)
+    uid = current_user.id
+
+    def q_sum(type_: str, col=Transaction.amount_ves):
+        return db.query(func.coalesce(func.sum(col), 0.0)) \
+                 .filter(Transaction.user_id == uid, Transaction.type == type_).scalar()
+
+    now = datetime.now()
+    usdt_i = db.query(func.coalesce(func.sum(Transaction.amount), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "ingreso", Transaction.currency == "USDT").scalar()
+    usdt_g = db.query(func.coalesce(func.sum(Transaction.amount), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "gasto",   Transaction.currency == "USDT").scalar()
+    m_i = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "ingreso",
+                func.strftime("%Y-%m", Transaction.date) == now.strftime("%Y-%m")).scalar()
+    m_g = db.query(func.coalesce(func.sum(Transaction.amount_ves), 0.0)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "gasto",
+                func.strftime("%Y-%m", Transaction.date) == now.strftime("%Y-%m")).scalar()
+    cat_rows = db.query(Transaction.category, func.sum(Transaction.amount_ves)) \
+        .filter(Transaction.user_id == uid, Transaction.type == "gasto") \
+        .group_by(Transaction.category).all()
+
+    summary = {
+        "total_ingresos_ves": q_sum("ingreso"),
+        "total_gastos_ves":   q_sum("gasto"),
+        "saldo_ves":          q_sum("ingreso") - q_sum("gasto"),
+        "usdt_balance":       usdt_i - usdt_g,
+        "monthly_ingresos":   m_i,
+        "monthly_gastos":     m_g,
+        "categories":         {r[0]: r[1] for r in cat_rows},
+    }
+
+    last_txns_raw = db.query(Transaction) \
+        .filter(Transaction.user_id == uid) \
+        .order_by(Transaction.date.desc()).limit(10).all()
+    last_txns = [
+        {"type": t.type, "date": t.date.strftime("%d/%m"),
+         "category": t.category, "description": t.description, "amount_ves": t.amount_ves}
+        for t in last_txns_raw
+    ]
+
     bcv, binance = await asyncio.gather(fetch_bcv_rate(), fetch_binance_p2p_rate())
     rates = {"bcv": bcv, "binance_p2p": binance}
 
-    system_prompt = _build_system_prompt(current_user.username, rows, rates)
-
-    # Mapear roles: "assistant" → "model" (requerido por Gemini)
-    history = []
-    for msg in body.messages[:-1]:
-        history.append({
-            "role":  "model" if msg.role == "assistant" else "user",
-            "parts": [msg.content],
-        })
-
-    last_message = body.messages[-1].content
+    system_prompt = _build_system_prompt(current_user.username, summary, last_txns, rates)
 
     try:
-        client = _get_genai_client()
-
-        # Construir historial en formato del nuevo SDK
+        client   = _get_genai_client()
+        # CORREGIDO: variable 'history' (código muerto) eliminada, se usa 'contents' directamente
         contents = []
         for msg in body.messages[:-1]:
             contents.append(gtypes.Content(
@@ -568,7 +700,7 @@ async def ai_chat(
             ))
         contents.append(gtypes.Content(
             role  = "user",
-            parts = [gtypes.Part(text=last_message)],
+            parts = [gtypes.Part(text=body.messages[-1].content)],
         ))
 
         response = client.models.generate_content(

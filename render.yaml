@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: misfinanzas
+    runtime: python
+    plan: free
+
+    # ── Construcción ──────────────────────────────────────────
+    buildCommand: pip install -r requirements.txt
+
+    # ── Arranque ──────────────────────────────────────────────
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+
+    # ── Variables de entorno ──────────────────────────────────
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false          # Se ingresa manualmente en el dashboard de Render
+      - key: PYTHON_VERSION
+        value: 3.11.0
+
+    # ── Disco persistente (para finanzas.db y .secret_key) ───
+    # IMPORTANTE: el plan free de Render NO incluye disco persistente.
+    # Sin esto, finanzas.db se borra cada vez que el servicio se reinicia.
+    # Opciones:
+    #   A) Agregar disco de pago ($0.25/GB/mes) descomentando el bloque de abajo
+    #   B) Usar PostgreSQL gratuito de Supabase (ver instrucciones al final)
+    #
+    # disk:
+    #   name: misfinanzas-data
+    #   mountPath: /data
+    #   sizeGB: 1
