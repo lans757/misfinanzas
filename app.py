@@ -22,6 +22,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 from typing import Optional, List
+import calendar as _cal
 
 # ── Rate Limiter ──────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
@@ -50,7 +51,8 @@ def _load_env():
                 os.environ.setdefault(k.strip(), v.strip())
 
 _load_env()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+ADMIN_USERNAME  = os.environ.get("ADMIN_USERNAME", "admin").strip().lower()
 
 
 def _save_gemini_key(key: str):
@@ -111,6 +113,7 @@ class User(Base):
     username        = Column(String(150), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
     created_at      = Column(DateTime, default=datetime.now)
+    is_admin        = Column(Integer, default=0)
 
 
 class Transaction(Base):
@@ -160,6 +163,27 @@ class BudgetAlert(Base):
     active        = Column(Integer, default=1)
 
 
+class CasheaPayment(Base):
+    __tablename__ = "cashea_payments"
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(Integer, nullable=False, index=True)
+    due_date    = Column(DateTime, nullable=False, index=True)
+    amount_usd  = Column(Float, nullable=False)
+    description = Column(String(200), nullable=True)
+    paid        = Column(Integer, default=0)
+    created_at  = Column(DateTime, default=datetime.now)
+
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+    id          = Column(Integer, primary_key=True, index=True)
+    type        = Column(String(50), nullable=False)
+    name        = Column(String(150), nullable=True)
+    description = Column(Text, nullable=False)
+    image_data  = Column(Text, nullable=True)
+    created_at  = Column(DateTime, default=datetime.now)
+
+
 Base.metadata.create_all(bind=engine)
 
 # ── Migraciones SQLite: columnas nuevas en tablas existentes ──────────────────
@@ -169,6 +193,7 @@ if _is_sqlite:
         for _stmt in [
             "ALTER TABLE transactions ADD COLUMN user_id INTEGER",
             "ALTER TABLE transactions ADD COLUMN tags TEXT",
+            "ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0",
         ]:
             try:
                 _conn.execute(text(_stmt))
@@ -218,6 +243,12 @@ async def get_current_user(
     if not user:
         raise HTTPException(401, "Usuario no encontrado")
     return user
+
+
+async def get_current_admin(current_user: User = Depends(get_current_user)) -> User:
+    if not current_user.is_admin:
+        raise HTTPException(403, "Acceso restringido a administradores")
+    return current_user
 
 
 # ── Tasas externas ────────────────────────────────────────────────────────────
@@ -351,6 +382,29 @@ class BudgetAlertOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class CasheaPaymentCreate(BaseModel):
+    due_date:    datetime
+    amount_usd:  float
+    description: Optional[str] = None
+
+
+class CasheaPaymentOut(BaseModel):
+    id:          int
+    due_date:    datetime
+    amount_usd:  float
+    description: Optional[str]
+    paid:        int
+    created_at:  datetime
+    model_config = {"from_attributes": True}
+
+
+class FeedbackIn(BaseModel):
+    type:        str
+    name:        Optional[str] = None
+    description: str
+    image_data:  Optional[str] = None
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="MisFinanzas")
 app.state.limiter = limiter
@@ -368,7 +422,11 @@ def register(request: Request, body: RegisterRequest, db: Session = Depends(get_
         raise HTTPException(400, "La contraseña debe tener mínimo 6 caracteres")
     if db.query(User).filter(User.username == username).first():
         raise HTTPException(400, "Ese nombre de usuario ya está en uso")
-    user = User(username=username, hashed_password=hash_password(body.password))
+    user = User(
+        username=username,
+        hashed_password=hash_password(body.password),
+        is_admin=1 if username == ADMIN_USERNAME else 0,
+    )
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -385,6 +443,9 @@ def login(request: Request, body: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == body.username.strip().lower()).first()
     if not user or not verify_password(body.password, user.hashed_password):
         raise HTTPException(401, "Usuario o contraseña incorrectos")
+    if user.username == ADMIN_USERNAME and not user.is_admin:
+        user.is_admin = 1
+        db.commit()
     return {
         "access_token": create_token(user.username),
         "token_type":   "bearer",
@@ -398,6 +459,7 @@ def me(current_user: User = Depends(get_current_user)):
         "id":         current_user.id,
         "username":   current_user.username,
         "created_at": current_user.created_at.isoformat(),
+        "is_admin":   bool(current_user.is_admin),
     }
 
 
@@ -903,6 +965,255 @@ def export_csv(db: Session = Depends(get_db), current_user: User = Depends(get_c
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
+
+# ── Feedback ──────────────────────────────────────────────────────────────────
+@app.post("/api/feedback", status_code=201)
+def submit_feedback(body: FeedbackIn, db: Session = Depends(get_db)):
+    fb = Feedback(
+        type=body.type,
+        name=body.name,
+        description=body.description,
+        image_data=body.image_data,
+    )
+    db.add(fb)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/feedback")
+def get_feedback(db: Session = Depends(get_db)):
+    items = db.query(Feedback).order_by(Feedback.created_at.desc()).all()
+    return [
+        {
+            "id": f.id,
+            "type": f.type,
+            "name": f.name or "Anónimo",
+            "description": f.description,
+            "has_image": bool(f.image_data),
+            "image_data": f.image_data,
+            "created_at": f.created_at.isoformat() if f.created_at else None,
+        }
+        for f in items
+    ]
+
+
+# ── Panel de administración ───────────────────────────────────────────────────
+@app.get("/api/admin/feedback")
+def admin_list_feedback(
+    db:    Session = Depends(get_db),
+    _admin: User  = Depends(get_current_admin),
+):
+    items = db.query(Feedback).order_by(Feedback.created_at.desc()).all()
+    return [
+        {
+            "id":          f.id,
+            "type":        f.type,
+            "name":        f.name or "Anónimo",
+            "description": f.description,
+            "image_data":  f.image_data,
+            "created_at":  f.created_at.isoformat() if f.created_at else None,
+        }
+        for f in items
+    ]
+
+
+@app.delete("/api/admin/feedback/{feedback_id}", status_code=200)
+def admin_delete_feedback(
+    feedback_id: int,
+    db:    Session = Depends(get_db),
+    _admin: User  = Depends(get_current_admin),
+):
+    fb = db.query(Feedback).filter(Feedback.id == feedback_id).first()
+    if not fb:
+        raise HTTPException(404, "Reporte no encontrado")
+    db.delete(fb)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/admin/users")
+def admin_list_users(
+    db:    Session = Depends(get_db),
+    _admin: User  = Depends(get_current_admin),
+):
+    users = db.query(User).order_by(User.created_at.desc()).all()
+    return [
+        {
+            "id":         u.id,
+            "username":   u.username,
+            "is_admin":   bool(u.is_admin),
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        }
+        for u in users
+    ]
+
+
+@app.delete("/api/admin/users/{user_id}", status_code=200)
+def admin_delete_user(
+    user_id: int,
+    db:     Session = Depends(get_db),
+    admin:  User   = Depends(get_current_admin),
+):
+    if user_id == admin.id:
+        raise HTTPException(400, "No puedes eliminarte a ti mismo")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "Usuario no encontrado")
+    db.delete(user)
+    db.commit()
+    return {"ok": True}
+
+
+# ── Cashea ───────────────────────────────────────────────────────────────────
+@app.get("/api/cashea", response_model=List[CasheaPaymentOut])
+def list_cashea(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return (
+        db.query(CasheaPayment)
+        .filter(CasheaPayment.user_id == current_user.id)
+        .order_by(CasheaPayment.due_date.asc())
+        .all()
+    )
+
+
+@app.post("/api/cashea", response_model=CasheaPaymentOut, status_code=201)
+def create_cashea(body: CasheaPaymentCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    c = CasheaPayment(
+        user_id=current_user.id,
+        due_date=body.due_date,
+        amount_usd=body.amount_usd,
+        description=body.description,
+    )
+    db.add(c); db.commit(); db.refresh(c)
+    return c
+
+
+@app.put("/api/cashea/{cid}/toggle")
+def toggle_cashea(cid: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    c = db.query(CasheaPayment).filter(CasheaPayment.id == cid, CasheaPayment.user_id == current_user.id).first()
+    if not c:
+        raise HTTPException(404, "Pago Cashea no encontrado")
+    c.paid = 0 if c.paid else 1
+    db.commit()
+    return {"ok": True, "paid": bool(c.paid)}
+
+
+@app.delete("/api/cashea/{cid}")
+def delete_cashea(cid: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    c = db.query(CasheaPayment).filter(CasheaPayment.id == cid, CasheaPayment.user_id == current_user.id).first()
+    if not c:
+        raise HTTPException(404, "Pago Cashea no encontrado")
+    db.delete(c); db.commit()
+    return {"ok": True}
+
+
+# ── Calendario ───────────────────────────────────────────────────────────────
+@app.get("/api/calendar/{year}/{month}")
+def get_calendar(
+    year:         int,
+    month:        int,
+    db:           Session = Depends(get_db),
+    current_user: User    = Depends(get_current_user),
+):
+    uid = current_user.id
+    _, days_in_month = _cal.monthrange(year, month)
+    start = datetime(year, month, 1)
+    end   = datetime(year, month, days_in_month, 23, 59, 59)
+
+    txns = db.query(Transaction).filter(
+        Transaction.user_id == uid,
+        Transaction.date    >= start,
+        Transaction.date    <= end,
+    ).all()
+
+    days: dict = {}
+    for t in txns:
+        key = str(t.date.day)
+        if key not in days:
+            days[key] = {"ingresos": 0.0, "gastos": 0.0, "bcv": None, "binance_p2p": None, "count": 0}
+        if t.type == "ingreso":
+            days[key]["ingresos"] += t.amount_ves
+        else:
+            days[key]["gastos"] += t.amount_ves
+        days[key]["count"] += 1
+        if days[key]["bcv"] is None and t.exchange_rate_bcv:
+            days[key]["bcv"] = t.exchange_rate_bcv
+        if days[key]["binance_p2p"] is None and t.exchange_rate_binance:
+            days[key]["binance_p2p"] = t.exchange_rate_binance
+
+    for key, d in days.items():
+        if d["bcv"] is None or d["binance_p2p"] is None:
+            day_num   = int(key)
+            day_start = datetime(year, month, day_num)
+            day_end   = datetime(year, month, day_num, 23, 59, 59)
+            rate = db.query(RateHistory).filter(
+                RateHistory.date >= day_start,
+                RateHistory.date <= day_end,
+            ).first()
+            if rate:
+                if d["bcv"] is None:         d["bcv"]         = rate.bcv
+                if d["binance_p2p"] is None: d["binance_p2p"] = rate.binance_p2p
+
+    # Pagos Cashea del mes
+    cashea_rows = db.query(CasheaPayment).filter(
+        CasheaPayment.user_id  == uid,
+        CasheaPayment.due_date >= start,
+        CasheaPayment.due_date <= end,
+    ).all()
+    for c in cashea_rows:
+        key = str(c.due_date.day)
+        if key not in days:
+            days[key] = {"ingresos": 0.0, "gastos": 0.0, "bcv": None, "binance_p2p": None, "count": 0}
+        days[key].setdefault("cashea", [])
+        days[key]["cashea"].append({
+            "id": c.id, "amount_usd": c.amount_usd,
+            "description": c.description, "paid": bool(c.paid),
+        })
+
+    return {"year": year, "month": month, "days_in_month": days_in_month, "days": days}
+
+
+@app.get("/api/calendar/{year}/{month}/{day}")
+def get_calendar_day(
+    year:         int,
+    month:        int,
+    day:          int,
+    db:           Session = Depends(get_db),
+    current_user: User    = Depends(get_current_user),
+):
+    uid       = current_user.id
+    day_start = datetime(year, month, day)
+    day_end   = datetime(year, month, day, 23, 59, 59)
+
+    txns = db.query(Transaction).filter(
+        Transaction.user_id == uid,
+        Transaction.date    >= day_start,
+        Transaction.date    <= day_end,
+    ).order_by(Transaction.date.asc()).all()
+
+    rate = db.query(RateHistory).filter(
+        RateHistory.date >= day_start,
+        RateHistory.date <= day_end,
+    ).order_by(RateHistory.date.desc()).first()
+
+    bcv     = rate.bcv         if rate else None
+    binance = rate.binance_p2p if rate else None
+    for t in txns:
+        if bcv     is None and t.exchange_rate_bcv:     bcv     = t.exchange_rate_bcv
+        if binance is None and t.exchange_rate_binance: binance = t.exchange_rate_binance
+
+    cashea_rows = db.query(CasheaPayment).filter(
+        CasheaPayment.user_id  == uid,
+        CasheaPayment.due_date >= day_start,
+        CasheaPayment.due_date <= day_end,
+    ).all()
+
+    return {
+        "transactions": [TransactionOut.model_validate(t).model_dump() for t in txns],
+        "bcv":          bcv,
+        "binance_p2p":  binance,
+        "cashea": [{"id": c.id, "amount_usd": c.amount_usd, "description": c.description, "paid": bool(c.paid)} for c in cashea_rows],
+    }
 
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
